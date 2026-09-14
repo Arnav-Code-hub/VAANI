@@ -35,6 +35,7 @@ import com.bithead.shelter.sensors.GestureDetector
 import com.bithead.shelter.ui.VaaniApp
 import com.bithead.shelter.ui.components.SafewordDialog
 import com.bithead.shelter.ui.theme.ShelterTheme
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
@@ -71,6 +72,9 @@ class MainActivity : FragmentActivity() {
 
         @Volatile
         private var sealingInProgress = false
+
+        @Volatile
+        private var activeSealCompletion: CompletableDeferred<Unit>? = null
     }
 
     private lateinit var db: AppDatabase
@@ -471,7 +475,7 @@ class MainActivity : FragmentActivity() {
                 if (captureState == CaptureState.RECORDING) stopEmergency()
             }
         } catch (e: Exception) {
-            recorder?.release()
+            runCatching { recorder?.release() }
             recorder = null
             analyzer.stopAndAnalyze()
             val preservedRaw = rawFile?.takeIf { it.exists() }
@@ -488,6 +492,8 @@ class MainActivity : FragmentActivity() {
 
     private fun stopEmergency() {
         if (captureState != CaptureState.RECORDING) return
+        val sealCompletion = CompletableDeferred<Unit>()
+        activeSealCompletion = sealCompletion
         sealingInProgress = true
         captureState = CaptureState.SEALING
         liveThreatJob?.cancel()
@@ -497,14 +503,14 @@ class MainActivity : FragmentActivity() {
 
         val result = analyzer.stopAndAnalyze()
         val recorderStopped = recorder?.runCatching { stop() }?.isSuccess == true
-        recorder?.release()
+        runCatching { recorder?.release() }
         recorder = null
         val raw = rawFile
         rawFile = null
 
         if (!recorderStopped || raw == null || !raw.exists() || raw.length() == 0L) {
             threatLabel = "Recording could not be finalized"
-            sealingInProgress = false
+            finishActiveSeal(sealCompletion)
             captureState = CaptureState.IDLE
             lifecycleScope.launch {
                 snackbarHostState.showSnackbar(
@@ -516,18 +522,25 @@ class MainActivity : FragmentActivity() {
         }
 
         lifecycleScope.launch {
+            var sealFailure: Exception? = null
             val sealed = try {
                 sealEvidence(raw, result.label, result.score)
             } catch (e: Exception) {
-                threatLabel = "Sealing failed: ${e.message}"
-                snackbarHostState.showSnackbar(
-                    "Evidence could not be sealed: ${e.message ?: "storage error"}. Raw audio was retained for recovery."
-                )
-                return@launch
+                sealFailure = e
+                null
             } finally {
-                sealingInProgress = false
+                finishActiveSeal(sealCompletion)
                 captureState = CaptureState.IDLE
                 if (!gestureWakeMode) restartSafewordListening()
+            }
+
+            if (sealed == null) {
+                val failure = sealFailure
+                threatLabel = "Sealing failed: ${failure?.message}"
+                snackbarHostState.showSnackbar(
+                    "Evidence could not be sealed: ${failure?.message ?: "storage error"}. Raw audio was retained for recovery."
+                )
+                return@launch
             }
 
             threatLabel = result.label
@@ -620,10 +633,14 @@ class MainActivity : FragmentActivity() {
         }
     }
 
-    private suspend fun awaitActiveSeal() = withContext(NonCancellable + Dispatchers.IO) {
-        do {
-            sealMutex.withLock { }
-        } while (sealingInProgress)
+    private fun finishActiveSeal(completion: CompletableDeferred<Unit>) {
+        sealingInProgress = false
+        completion.complete(Unit)
+        if (activeSealCompletion === completion) activeSealCompletion = null
+    }
+
+    private suspend fun awaitActiveSeal() {
+        activeSealCompletion?.await()
     }
 
     /**
