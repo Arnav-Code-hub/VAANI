@@ -15,16 +15,17 @@ class GestureDetector(
     private val sensorManager = context.applicationContext
         .getSystemService(Context.SENSOR_SERVICE) as SensorManager
     private val accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
-    private var lastTriggerAt = 0L
+    private val triggerGate = JerkTriggerGate()
     private var started = false
 
-    init {
-        check(JERK_THRESHOLD in 20f..24f)
-    }
+    val isAvailable: Boolean get() = accelerometer != null
 
-    fun start() {
-        if (started || accelerometer == null) return
+    fun start(): Boolean {
+        if (started) return true
+        if (accelerometer == null) return false
+        triggerGate.reset()
         started = sensorManager.registerListener(this, accelerometer, SensorManager.SENSOR_DELAY_GAME)
+        return started
     }
 
     fun stop() {
@@ -38,18 +39,36 @@ class GestureDetector(
         val x = event.values[0]
         val y = event.values[1]
         val z = event.values[2]
-        val magnitude = sqrt(x * x + y * y + z * z)
-        val now = SystemClock.elapsedRealtime()
-        if (magnitude >= JERK_THRESHOLD && now - lastTriggerAt >= COOLDOWN_MS) {
-            lastTriggerAt = now
+        val magnitudeG = sqrt(x * x + y * y + z * z) / SensorManager.GRAVITY_EARTH
+        if (triggerGate.onSample(magnitudeG, SystemClock.elapsedRealtime())) {
             onJerkDetected()
         }
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
 
-    private companion object {
-        const val JERK_THRESHOLD = 22f
-        const val COOLDOWN_MS = 4_000L
+}
+
+internal class JerkTriggerGate(
+    private val thresholdG: Float = 1.8f,
+    private val cooldownMs: Long = 2_500L
+) {
+    private var aboveThreshold = false
+    private var lastTriggerAt: Long? = null
+
+    fun onSample(magnitudeG: Float, nowMs: Long): Boolean {
+        val crossedThreshold = magnitudeG >= thresholdG && !aboveThreshold
+        aboveThreshold = magnitudeG >= thresholdG
+        if (!crossedThreshold) return false
+
+        val last = lastTriggerAt
+        if (last != null && nowMs - last < cooldownMs) return false
+        lastTriggerAt = nowMs
+        return true
+    }
+
+    fun reset() {
+        aboveThreshold = false
+        lastTriggerAt = null
     }
 }

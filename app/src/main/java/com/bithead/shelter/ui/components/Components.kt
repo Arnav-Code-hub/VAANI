@@ -19,8 +19,11 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.LocationOn
+import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Replay
 import androidx.compose.material.icons.filled.Security
+import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -33,6 +36,15 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.bithead.shelter.ui.theme.*
+import java.util.Locale
+
+data class EvidencePlaybackState(
+    val evidenceId: Long? = null,
+    val isPreparing: Boolean = false,
+    val isPlaying: Boolean = false,
+    val positionMs: Long = 0L,
+    val durationMs: Long = 0L
+)
 
 /** Big center action button with a soft breathing/pulsing halo behind it. */
 @Composable
@@ -176,7 +188,10 @@ fun EvidenceCard(
     chainHash: String,
     previousHash: String?,
     summary: String,
-    onPlay: () -> Unit,
+    playback: EvidencePlaybackState,
+    onPlayPause: () -> Unit,
+    onStop: () -> Unit,
+    onSeek: (Long) -> Unit,
     onExport: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -184,6 +199,12 @@ fun EvidenceCard(
         threatScore >= 70 -> ShelterDanger
         threatScore >= 35 -> ShelterAmber
         else -> ShelterSafe
+    }
+    val isActive = playback.evidenceId == index
+    var draggedPosition by remember(index) { mutableFloatStateOf(0f) }
+    var isDragging by remember(index) { mutableStateOf(false) }
+    LaunchedEffect(isActive, playback.positionMs) {
+        if (isActive && !isDragging) draggedPosition = playback.positionMs.toFloat()
     }
     ElevatedCard(
         modifier = modifier.fillMaxWidth(),
@@ -249,16 +270,63 @@ fun EvidenceCard(
                 lineHeight = 16.sp
             )
 
+            if (isActive) {
+                Spacer(Modifier.height(12.dp))
+                val duration = playback.durationMs.coerceAtLeast(1L)
+                Slider(
+                    value = draggedPosition.coerceIn(0f, duration.toFloat()),
+                    onValueChange = {
+                        isDragging = true
+                        draggedPosition = it
+                    },
+                    onValueChangeFinished = {
+                        isDragging = false
+                        if (playback.durationMs > 0L) onSeek(draggedPosition.toLong())
+                    },
+                    valueRange = 0f..duration.toFloat(),
+                    enabled = !playback.isPreparing && playback.durationMs > 0L
+                )
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    Text(formatPlaybackTime(if (isDragging) draggedPosition.toLong() else playback.positionMs), style = MaterialTheme.typography.labelSmall, color = ShelterTextDim)
+                    Text(formatPlaybackTime(playback.durationMs), style = MaterialTheme.typography.labelSmall, color = ShelterTextDim)
+                }
+            }
+
             Spacer(Modifier.height(12.dp))
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 FilledTonalButton(
-                    onClick = onPlay,
+                    onClick = onPlayPause,
+                    enabled = !playback.isPreparing,
                     modifier = Modifier.weight(1f),
                     colors = ButtonDefaults.filledTonalButtonColors(containerColor = ShelterSurfaceRaised, contentColor = MaterialTheme.colorScheme.onSurface)
                 ) {
-                    Icon(Icons.Filled.PlayArrow, contentDescription = null, modifier = Modifier.size(18.dp))
+                    if (isActive && playback.isPreparing) {
+                        CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                    } else {
+                        val completed = isActive && playback.durationMs > 0L && playback.positionMs >= playback.durationMs
+                        Icon(
+                            when {
+                                isActive && playback.isPlaying -> Icons.Filled.Pause
+                                completed -> Icons.Filled.Replay
+                                else -> Icons.Filled.PlayArrow
+                            },
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
                     Spacer(Modifier.width(6.dp))
-                    Text("Play")
+                    Text(when {
+                        isActive && playback.isPreparing -> "Opening…"
+                        isActive && playback.isPlaying -> "Pause"
+                        isActive && playback.durationMs > 0L && playback.positionMs >= playback.durationMs -> "Replay"
+                        isActive -> "Resume"
+                        else -> "Play"
+                    })
+                }
+                if (isActive) {
+                    IconButton(onClick = onStop) {
+                        Icon(Icons.Filled.Stop, contentDescription = "Stop playback")
+                    }
                 }
                 OutlinedButton(
                     onClick = onExport,
@@ -269,6 +337,13 @@ fun EvidenceCard(
             }
         }
     }
+}
+
+private fun formatPlaybackTime(milliseconds: Long): String {
+    val totalSeconds = (milliseconds.coerceAtLeast(0L) / 1_000L)
+    val minutes = totalSeconds / 60L
+    val seconds = totalSeconds % 60L
+    return "%d:%02d".format(Locale.getDefault(), minutes, seconds)
 }
 
 /** Small pill row used for the safeword display + edit affordance. */

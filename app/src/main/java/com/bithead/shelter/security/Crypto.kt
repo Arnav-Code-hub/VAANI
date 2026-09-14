@@ -8,7 +8,6 @@ import java.io.FileOutputStream
 import java.nio.charset.StandardCharsets
 import java.security.KeyStore
 import java.security.MessageDigest
-import java.security.SecureRandom
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -50,9 +49,13 @@ object Crypto {
     fun newKey(): SecretKey = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
 
     fun encrypt(input: File, output: File, key: SecretKey) {
-        val iv = ByteArray(IV_SIZE).also { SecureRandom().nextBytes(it) }
         val cipher = Cipher.getInstance(TRANSFORMATION)
-        cipher.init(Cipher.ENCRYPT_MODE, key, GCMParameterSpec(128, iv))
+        // Android Keystore keys require the provider to generate a fresh IV
+        // for encryption. Supplying a caller-generated IV throws
+        // "Caller-provided IV not permitted" on affected devices.
+        cipher.init(Cipher.ENCRYPT_MODE, key)
+        val iv = cipher.iv
+        check(iv.size == IV_SIZE) { "Unexpected AES-GCM IV length: ${iv.size}" }
         val plaintext = input.readBytes()
         val ciphertext = cipher.doFinal(plaintext)
         FileOutputStream(output).use { stream ->

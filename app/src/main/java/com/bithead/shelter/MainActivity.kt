@@ -4,11 +4,13 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.location.Location
 import android.location.LocationManager
 import android.media.MediaPlayer
 import android.media.MediaRecorder
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.speech.RecognitionListener
@@ -33,9 +35,11 @@ import com.bithead.shelter.security.Crypto
 import com.bithead.shelter.security.AppDisguiseManager
 import com.bithead.shelter.sensors.GestureDetector
 import com.bithead.shelter.ui.VaaniApp
+import com.bithead.shelter.ui.components.EvidencePlaybackState
 import com.bithead.shelter.ui.components.SafewordDialog
 import com.bithead.shelter.ui.theme.ShelterTheme
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
@@ -45,6 +49,7 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.io.IOException
 import java.nio.file.AtomicMoveNotSupportedException
@@ -62,6 +67,13 @@ class MainActivity : FragmentActivity() {
 
     private data class RecoveryResult(val recovered: Int, val failure: String? = null)
 
+    private data class LocationFix(
+        val latitude: Double,
+        val longitude: Double,
+        val accuracyMeters: Float?,
+        val timestampMillis: Long
+    )
+
     companion object {
         // Shared across Activity recreation so a new startup recovery cannot
         // race an in-flight seal owned by the previous Activity instance.
@@ -75,6 +87,10 @@ class MainActivity : FragmentActivity() {
 
         @Volatile
         private var activeSealCompletion: CompletableDeferred<Unit>? = null
+
+        private const val GESTURE_WINDOW_SECONDS = 12
+        private const val GESTURE_READY_TIMEOUT_MS = 3_000L
+        private const val GESTURE_FINAL_RESULT_TIMEOUT_MS = 2_000L
     }
 
     private lateinit var db: AppDatabase
@@ -83,6 +99,10 @@ class MainActivity : FragmentActivity() {
     private lateinit var key: SecretKey
     private val analyzer by lazy { ThreatAnalyzer(this) }
     private var mediaPlayer: MediaPlayer? = null
+    private var playbackTempFile: File? = null
+    private var playbackLoadJob: Job? = null
+    private var playbackPositionJob: Job? = null
+    private var playbackRequestId = 0L
     private var speechRecognizer: SpeechRecognizer? = null
     private lateinit var gestureDetector: GestureDetector
     private var autoStopJob: Job? = null
@@ -97,6 +117,8 @@ class MainActivity : FragmentActivity() {
     private var lastLng by mutableStateOf<Double?>(null)
     private var communityLat by mutableStateOf<Double?>(null)
     private var communityLng by mutableStateOf<Double?>(null)
+    private var communityAccuracy by mutableStateOf<Float?>(null)
+    private var communityLocationTime by mutableLongStateOf(0L)
     private var showSafewordDialog by mutableStateOf(false)
     private var liveThreatJob: Job? = null
     private var vaultUnlocked by mutableStateOf(false)
@@ -104,10 +126,20 @@ class MainActivity : FragmentActivity() {
     private var listeningEnabled by mutableStateOf(true)
     private var gestureWakeMode by mutableStateOf(false)
     private var safewordListeningActive by mutableStateOf(false)
+    private var gestureWindowOpening by mutableStateOf(false)
+    private var gestureWindowPending = false
+    private var gestureWindowDeadlineMs = 0L
+    private var gestureWindowSecondsRemaining by mutableIntStateOf(0)
+    private var speechRequestInFlight = false
+    private var safewordActivationPending = false
+    private var pendingGestureEnable = false
     private var disguiseEnabled by mutableStateOf(false)
+    private var playbackState by mutableStateOf(EvidencePlaybackState())
     private var foreground = false
     private var restartListeningJob: Job? = null
     private var safewordWindowJob: Job? = null
+    private var gestureRecognitionRestartJob: Job? = null
+    private var safewordActivationJob: Job? = null
     private var communityLocationJob: Job? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -115,12 +147,20 @@ class MainActivity : FragmentActivity() {
         enableEdgeToEdge()
         db = AppDatabase.get(this)
         key = loadOrCreateMasterKey()
+        lifecycleScope.launch(Dispatchers.IO) {
+            cacheDir.listFiles { file -> file.name.startsWith("temp_play_") }
+                ?.forEach(File::delete)
+        }
         val needsStartupRecovery = !startupRecoveryComplete
         val needsPipelineBarrier = needsStartupRecovery || sealingInProgress
         if (needsPipelineBarrier) captureState = CaptureState.SEALING
         safewordState = loadSafeword()
         listeningEnabled = getSharedPreferences("shelter_prefs", MODE_PRIVATE).getBoolean("listening", true)
         gestureWakeMode = getSharedPreferences("shelter_prefs", MODE_PRIVATE).getBoolean("gesture_wake_mode", false)
+        if (gestureWakeMode && !listeningEnabled) {
+            listeningEnabled = true
+            getSharedPreferences("shelter_prefs", MODE_PRIVATE).edit().putBoolean("listening", true).apply()
+        }
         disguiseEnabled = AppDisguiseManager.isEnabled(this)
         AppDisguiseManager.applyLauncherState(this, disguiseEnabled)
         requestPermissionsIfNeeded()
@@ -143,6 +183,8 @@ class MainActivity : FragmentActivity() {
                     lng = lastLng,
                     mapLat = communityLat,
                     mapLng = communityLng,
+                    mapAccuracyMeters = communityAccuracy,
+                    mapLocationTimestamp = communityLocationTime.takeIf { it > 0L },
                     evidence = evidenceList,
                     vaultUnlocked = vaultUnlocked,
                     biometricAvailable = biometricAvailable,
@@ -157,7 +199,10 @@ class MainActivity : FragmentActivity() {
                         }
                     },
                     onEditSafeword = { showSafewordDialog = true },
-                    onPlay = { playEvidence(it) },
+                    playbackState = playbackState,
+                    onPlaybackToggle = { toggleEvidencePlayback(it) },
+                    onPlaybackStop = { stopEvidencePlayback() },
+                    onPlaybackSeek = { evidence, position -> seekEvidencePlayback(evidence, position) },
                     onExport = { exportChainOfCustody(it) },
                     onVerifyChain = { verifyEvidenceChain() },
                     onUnlockVault = { unlockVault() },
@@ -165,10 +210,13 @@ class MainActivity : FragmentActivity() {
                     listeningActive = safewordListeningActive,
                     onListeningChange = { updateListeningEnabled(it) },
                     gestureWakeMode = gestureWakeMode,
+                    gestureWindowOpening = gestureWindowOpening,
+                    gestureWindowSecondsRemaining = gestureWindowSecondsRemaining,
                     onGestureWakeModeChange = { updateGestureWakeMode(it) },
                     disguiseEnabled = disguiseEnabled,
                     onDisguiseEnabledChange = { updateAppDisguise(it) },
-                    onLockVault = { vaultUnlocked = false },
+                    onLockVault = { stopEvidencePlayback(); vaultUnlocked = false },
+                    onVaultHidden = { stopEvidencePlayback() },
                     onRefreshMapLocation = { refreshCommunityLocation() }
                 )
                 if (showSafewordDialog) {
@@ -212,9 +260,29 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun requestPermissionsIfNeeded() {
-        val needed = arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.ACCESS_FINE_LOCATION)
-            .filter { ActivityCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }
+        val needed = mutableListOf<String>()
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            needed += Manifest.permission.RECORD_AUDIO
+        }
+        if (!hasLocationPermission()) {
+            // Android 12+ requires both permissions in the same request so the
+            // system can offer the user its Precise / Approximate choice.
+            needed += Manifest.permission.ACCESS_FINE_LOCATION
+            needed += Manifest.permission.ACCESS_COARSE_LOCATION
+        }
         if (needed.isNotEmpty()) ActivityCompat.requestPermissions(this, needed.toTypedArray(), 10)
+    }
+
+    private fun hasLocationPermission(): Boolean {
+        val hasFine = ActivityCompat.checkSelfPermission(
+            this,
+            Manifest.permission.ACCESS_FINE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+        val hasCoarse = ActivityCompat.checkSelfPermission(
+            this,
+            Manifest.permission.ACCESS_COARSE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+        return hasFine || hasCoarse
     }
 
     /**
@@ -222,57 +290,91 @@ class MainActivity : FragmentActivity() {
      * or null getLastKnownLocation() reading. Falls back to the last-known
      * fix only if a live update can't be obtained within the timeout.
      */
-    private suspend fun getLocation(): Pair<Double?, Double?> {
-        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-            lifecycleScope.launch { snackbarHostState.showSnackbar("Location permission denied — location features are unavailable") }
-            return Pair(null, null)
-        }
-        val lm = getSystemService(Context.LOCATION_SERVICE) as LocationManager
-        val provider = when {
-            lm.isProviderEnabled(LocationManager.GPS_PROVIDER) -> LocationManager.GPS_PROVIDER
-            lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER) -> LocationManager.NETWORK_PROVIDER
-            else -> null
-        }
-        if (provider == null) {
-            snackbarHostState.showSnackbar("Location services are off — using last known fix if any")
-            val loc = lm.getLastKnownLocation(LocationManager.GPS_PROVIDER)
-                ?: lm.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
-            return Pair(loc?.latitude, loc?.longitude)
+    private suspend fun getLocation(): LocationFix? {
+        val hasFine = ActivityCompat.checkSelfPermission(
+            this,
+            Manifest.permission.ACCESS_FINE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+        val hasCoarse = ActivityCompat.checkSelfPermission(
+            this,
+            Manifest.permission.ACCESS_COARSE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+        if (!hasFine && !hasCoarse) {
+            snackbarHostState.showSnackbar("Location permission denied — location features are unavailable")
+            return null
         }
 
-        return suspendCancellableCoroutine { cont ->
-            var resumed = false
-            val listener = object : android.location.LocationListener {
-                override fun onLocationChanged(location: android.location.Location) {
-                    if (!resumed) {
-                        resumed = true
-                        lm.removeUpdates(this)
-                        cont.resume(Pair(location.latitude, location.longitude))
+        val lm = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+        val lastKnownProviders = buildList {
+            add(LocationManager.NETWORK_PROVIDER)
+            if (hasFine) add(LocationManager.GPS_PROVIDER)
+        }
+        val bestLastKnown = lastKnownProviders
+            .mapNotNull { provider -> runCatching { lm.getLastKnownLocation(provider) }.getOrNull() }
+            .maxWithOrNull(compareBy<Location>({ it.time }, { if (it.hasAccuracy()) -it.accuracy else Float.NEGATIVE_INFINITY }))
+
+        val liveProviders = buildList {
+            if (runCatching { lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER) }.getOrDefault(false)) {
+                add(LocationManager.NETWORK_PROVIDER)
+            }
+            if (hasFine && runCatching { lm.isProviderEnabled(LocationManager.GPS_PROVIDER) }.getOrDefault(false)) {
+                add(LocationManager.GPS_PROVIDER)
+            }
+        }
+        if (liveProviders.isEmpty()) {
+            snackbarHostState.showSnackbar("Location services are off — using the most recent saved fix")
+            return bestLastKnown?.toLocationFix()
+        }
+
+        // Request network and GPS together. Indoors, the network provider can
+        // win immediately; otherwise the 3-second cap falls back to the best
+        // last-known reading instead of waiting indefinitely for satellites.
+        val liveLocation = withTimeoutOrNull(3_000L) {
+            suspendCancellableCoroutine<Location?> { cont ->
+                var completed = false
+                val listener = object : android.location.LocationListener {
+                    override fun onLocationChanged(location: Location) {
+                        if (!completed && cont.isActive) {
+                            completed = true
+                            runCatching { lm.removeUpdates(this) }
+                            cont.resume(location)
+                        }
                     }
                 }
-            }
-            try {
-                lm.requestLocationUpdates(provider, 0L, 0f, listener, mainLooper)
-            } catch (_: SecurityException) {
-                if (!resumed) { resumed = true; cont.resume(Pair(null, null)) }
-                return@suspendCancellableCoroutine
-            }
-
-            // Timeout: fall back to last-known fix rather than hanging forever.
-            lifecycleScope.launch {
-                delay(4000)
-                if (!resumed) {
-                    resumed = true
-                    lm.removeUpdates(listener)
-                    val loc = lm.getLastKnownLocation(provider)
-                    cont.resume(Pair(loc?.latitude, loc?.longitude))
+                var registered = false
+                liveProviders.forEach { provider ->
+                    try {
+                        lm.requestLocationUpdates(provider, 0L, 0f, listener, mainLooper)
+                        registered = true
+                    } catch (_: SecurityException) {
+                        // Try any remaining provider. The permission state may
+                        // have changed between the initial check and request.
+                    } catch (_: IllegalArgumentException) {
+                        // Provider disappeared or is unsupported on this device.
+                    }
+                }
+                if (!registered && !completed) {
+                    completed = true
+                    cont.resume(null)
+                }
+                cont.invokeOnCancellation {
+                    completed = true
+                    runCatching { lm.removeUpdates(listener) }
                 }
             }
-            cont.invokeOnCancellation { lm.removeUpdates(listener) }
         }
+        return (liveLocation ?: bestLastKnown)?.toLocationFix()
     }
 
+    private fun Location.toLocationFix() = LocationFix(
+        latitude = latitude,
+        longitude = longitude,
+        accuracyMeters = if (hasAccuracy() && accuracy.isFinite() && accuracy > 0f) accuracy else null,
+        timestampMillis = time.takeIf { it > 0L } ?: System.currentTimeMillis()
+    )
+
     private fun updateAppDisguise(enabled: Boolean) {
+        if (enabled) stopEvidencePlayback()
         AppDisguiseManager.setEnabled(this, enabled)
         disguiseEnabled = enabled
     }
@@ -280,9 +382,12 @@ class MainActivity : FragmentActivity() {
     private fun refreshCommunityLocation() {
         communityLocationJob?.cancel()
         communityLocationJob = lifecycleScope.launch {
-            val (latitude, longitude) = getLocation()
-            communityLat = latitude
-            communityLng = longitude
+            getLocation()?.let { fix ->
+                communityLat = fix.latitude
+                communityLng = fix.longitude
+                communityAccuracy = fix.accuracyMeters
+                communityLocationTime = fix.timestampMillis
+            }
         }
     }
 
@@ -291,25 +396,59 @@ class MainActivity : FragmentActivity() {
     private fun initSpeechRecognizer() {
         if (!SpeechRecognizer.isRecognitionAvailable(this)) {
             listeningEnabled = false
+            gestureWakeMode = false
+            getSharedPreferences("shelter_prefs", MODE_PRIVATE).edit()
+                .putBoolean("listening", false)
+                .putBoolean("gesture_wake_mode", false)
+                .apply()
             return
         }
         speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this).apply {
             setRecognitionListener(object : RecognitionListener {
                 override fun onReadyForSpeech(params: Bundle?) {
-                    safewordListeningActive = captureState == CaptureState.IDLE
+                    speechRequestInFlight = false
+                    if (captureState != CaptureState.IDLE) return
+                    safewordListeningActive = true
+                    if (gestureWakeMode && gestureWindowPending) {
+                        gestureWindowOpening = false
+                        if (gestureWindowDeadlineMs == 0L) {
+                            gestureWindowDeadlineMs = SystemClock.elapsedRealtime() + GESTURE_WINDOW_SECONDS * 1_000L
+                            getSystemService(Vibrator::class.java)?.takeIf { it.hasVibrator() }?.vibrate(
+                                VibrationEffect.createOneShot(30L, VibrationEffect.DEFAULT_AMPLITUDE)
+                            )
+                            startGestureWindowCountdown()
+                        }
+                    }
                 }
                 override fun onBeginningOfSpeech() {}
                 override fun onRmsChanged(rmsdB: Float) {}
                 override fun onBufferReceived(buffer: ByteArray?) {}
                 override fun onEndOfSpeech() {}
                 override fun onError(error: Int) {
+                    val wasGestureWindow = gestureWakeMode && gestureWindowPending
+                    speechRequestInFlight = false
                     safewordListeningActive = false
-                    if (captureState == CaptureState.IDLE && !gestureWakeMode) restartSafewordListening()
+                    if (wasGestureWindow) {
+                        val retryable = error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT
+                        if (!retryable || !restartGestureRecognitionIfTimeRemains()) {
+                            finishGestureWindow(cancelRecognizer = false)
+                            lifecycleScope.launch {
+                                snackbarHostState.showSnackbar(speechErrorMessage(error))
+                            }
+                        }
+                    } else if (captureState == CaptureState.IDLE && !gestureWakeMode) {
+                        restartSafewordListening()
+                    }
                 }
                 override fun onResults(results: Bundle?) {
-                    checkSafewordMatches(results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION))
+                    val wasGestureWindow = gestureWakeMode && gestureWindowPending
+                    val matched = checkSafewordMatches(results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION))
+                    speechRequestInFlight = false
                     safewordListeningActive = false
-                    if (captureState == CaptureState.IDLE && !gestureWakeMode) restartSafewordListening()
+                    if (wasGestureWindow && !matched && !restartGestureRecognitionIfTimeRemains()) {
+                        finishGestureWindow(cancelRecognizer = false)
+                    }
+                    if (captureState == CaptureState.IDLE && !gestureWakeMode && !matched) restartSafewordListening()
                 }
                 override fun onPartialResults(partialResults: Bundle?) {
                     checkSafewordMatches(partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION))
@@ -319,14 +458,47 @@ class MainActivity : FragmentActivity() {
         }
     }
 
-    private fun checkSafewordMatches(matches: ArrayList<String>?) {
-        if (captureState != CaptureState.IDLE || !listeningEnabled || !foreground ||
-            (gestureWakeMode && !safewordListeningActive)) return
-        matches?.forEach { phrase -> if (phrase.contains(safewordState, ignoreCase = true)) activateEmergency() }
+    private fun speechErrorMessage(error: Int): String = when (error) {
+        SpeechRecognizer.ERROR_NO_MATCH, SpeechRecognizer.ERROR_SPEECH_TIMEOUT ->
+            "Safeword not heard — gesture remains armed"
+        SpeechRecognizer.ERROR_RECOGNIZER_BUSY ->
+            "Speech recognizer was busy — wait a moment and jerk again"
+        SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS ->
+            "Microphone permission is required for the safeword window"
+        SpeechRecognizer.ERROR_NETWORK, SpeechRecognizer.ERROR_NETWORK_TIMEOUT ->
+            "Speech recognition is unavailable offline on this device"
+        else -> "Safeword window closed — gesture remains armed"
+    }
+
+    private fun checkSafewordMatches(matches: ArrayList<String>?): Boolean {
+        if (captureState != CaptureState.IDLE || !listeningEnabled || !foreground || safewordActivationPending ||
+            (gestureWakeMode && !gestureWindowPending)) return false
+        val matched = matches?.any { it.contains(safewordState, ignoreCase = true) } == true
+        if (matched) queueEmergencyFromSafeword()
+        return matched
+    }
+
+    private fun queueEmergencyFromSafeword() {
+        if (safewordActivationPending) return
+        safewordActivationPending = true
+        restartListeningJob?.cancel()
+        if (gestureWakeMode) finishGestureWindow(cancelRecognizer = true)
+        else {
+            speechRequestInFlight = false
+            safewordListeningActive = false
+            speechRecognizer?.cancel()
+        }
+        safewordActivationJob?.cancel()
+        safewordActivationJob = lifecycleScope.launch {
+            delay(200L)
+            safewordActivationPending = false
+            if (foreground && listeningEnabled && captureState == CaptureState.IDLE) activateEmergency()
+        }
     }
 
     private fun startSafewordListening(): Boolean {
         if (captureState != CaptureState.IDLE || !foreground || !listeningEnabled || speechRecognizer == null ||
+            speechRequestInFlight || safewordListeningActive ||
             ActivityCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) return false
         try {
             val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
@@ -339,32 +511,92 @@ class MainActivity : FragmentActivity() {
                 // "Known limitations" for the real offline-guarantee status.
                 putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
             }
+            speechRequestInFlight = true
             speechRecognizer?.startListening(intent)
-            safewordListeningActive = true
             return true
         } catch (_: Exception) {
+            speechRequestInFlight = false
             safewordListeningActive = false
             return false
         }
     }
 
-    private fun stopSafewordListening() {
-        speechRecognizer?.stopListening()
-        safewordListeningActive = false
-    }
-
     private fun startSafewordWindow() {
-        if (!gestureWakeMode || safewordListeningActive || captureState != CaptureState.IDLE ||
+        if (!gestureWakeMode || gestureWindowPending || safewordActivationPending || captureState != CaptureState.IDLE ||
             !foreground || !listeningEnabled) return
-        getSystemService(Vibrator::class.java)?.takeIf { it.hasVibrator() }?.vibrate(
-            VibrationEffect.createOneShot(30L, VibrationEffect.DEFAULT_AMPLITUDE)
-        )
-        if (!startSafewordListening()) return
+        gestureWindowPending = true
+        gestureWindowOpening = true
+        gestureWindowDeadlineMs = 0L
+        gestureWindowSecondsRemaining = 0
+        if (!startSafewordListening()) {
+            finishGestureWindow(cancelRecognizer = true)
+            lifecycleScope.launch {
+                snackbarHostState.showSnackbar("Could not open the safeword window — check microphone access")
+            }
+            return
+        }
         safewordWindowJob?.cancel()
         safewordWindowJob = lifecycleScope.launch {
-            delay(5_000L)
-            stopSafewordListening()
+            delay(GESTURE_READY_TIMEOUT_MS)
+            if (gestureWindowPending && gestureWindowOpening) {
+                finishGestureWindow(cancelRecognizer = true)
+                snackbarHostState.showSnackbar("Microphone did not become ready — gesture remains armed")
+            }
         }
+    }
+
+    private fun startGestureWindowCountdown() {
+        safewordWindowJob?.cancel()
+        gestureWindowSecondsRemaining = GESTURE_WINDOW_SECONDS
+        safewordWindowJob = lifecycleScope.launch {
+            while (gestureWindowPending) {
+                val remainingMs = gestureWindowDeadlineMs - SystemClock.elapsedRealtime()
+                if (remainingMs <= 0L) break
+                gestureWindowSecondsRemaining = ((remainingMs + 999L) / 1_000L).toInt()
+                delay(remainingMs.coerceAtMost(1_000L))
+            }
+            if (!gestureWindowPending) return@launch
+            gestureWindowSecondsRemaining = 0
+            safewordListeningActive = false
+            speechRecognizer?.stopListening()
+            delay(GESTURE_FINAL_RESULT_TIMEOUT_MS)
+            if (gestureWindowPending) finishGestureWindow(cancelRecognizer = true)
+        }
+    }
+
+    private fun restartGestureRecognitionIfTimeRemains(): Boolean {
+        if (!gestureWindowPending || gestureWindowDeadlineMs <= SystemClock.elapsedRealtime()) return false
+        gestureWindowOpening = true
+        gestureRecognitionRestartJob?.cancel()
+        gestureRecognitionRestartJob = lifecycleScope.launch {
+            delay(150L)
+            if (gestureWindowPending && !startSafewordListening()) {
+                finishGestureWindow(cancelRecognizer = true)
+                snackbarHostState.showSnackbar("Could not reopen the safeword listener — gesture remains armed")
+            }
+        }
+        return true
+    }
+
+    private fun finishGestureWindow(cancelRecognizer: Boolean) {
+        gestureWindowPending = false
+        gestureWindowOpening = false
+        gestureWindowDeadlineMs = 0L
+        gestureWindowSecondsRemaining = 0
+        speechRequestInFlight = false
+        safewordListeningActive = false
+        safewordWindowJob?.cancel()
+        safewordWindowJob = null
+        gestureRecognitionRestartJob?.cancel()
+        gestureRecognitionRestartJob = null
+        if (cancelRecognizer) speechRecognizer?.cancel()
+    }
+
+    private fun cancelSafewordSession() {
+        restartListeningJob?.cancel()
+        safewordActivationJob?.cancel()
+        safewordActivationPending = false
+        finishGestureWindow(cancelRecognizer = true)
     }
 
     private fun restartSafewordListening() {
@@ -382,30 +614,60 @@ class MainActivity : FragmentActivity() {
             return
         }
         listeningEnabled = enabled
-        getSharedPreferences("shelter_prefs", MODE_PRIVATE).edit().putBoolean("listening", enabled).apply()
-        restartListeningJob?.cancel()
-        safewordWindowJob?.cancel()
-        speechRecognizer?.cancel()
-        safewordListeningActive = false
-        if (enabled && !gestureWakeMode) startSafewordListening()
+        if (!enabled) gestureWakeMode = false
+        getSharedPreferences("shelter_prefs", MODE_PRIVATE).edit()
+            .putBoolean("listening", enabled)
+            .putBoolean("gesture_wake_mode", gestureWakeMode)
+            .apply()
+        cancelSafewordSession()
+        if (enabled && !gestureWakeMode) restartSafewordListening()
     }
 
     private fun updateGestureWakeMode(enabled: Boolean) {
+        if (enabled && !gestureDetector.isAvailable) {
+            lifecycleScope.launch { snackbarHostState.showSnackbar("This device has no accelerometer for Gesture-Wake") }
+            return
+        }
+        if (enabled && speechRecognizer == null) {
+            lifecycleScope.launch { snackbarHostState.showSnackbar("No speech recognition service is available on this device") }
+            return
+        }
+        if (enabled && ActivityCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            pendingGestureEnable = true
+            requestPermissionsIfNeeded()
+            return
+        }
+        if (enabled && foreground && !gestureDetector.start()) {
+            lifecycleScope.launch { snackbarHostState.showSnackbar("Accelerometer could not be started") }
+            return
+        }
+        pendingGestureEnable = false
         gestureWakeMode = enabled
-        getSharedPreferences("shelter_prefs", MODE_PRIVATE).edit().putBoolean("gesture_wake_mode", enabled).apply()
-        restartListeningJob?.cancel()
-        safewordWindowJob?.cancel()
-        speechRecognizer?.cancel()
-        safewordListeningActive = false
-        if (!enabled && listeningEnabled && foreground) startSafewordListening()
+        if (enabled) listeningEnabled = true
+        getSharedPreferences("shelter_prefs", MODE_PRIVATE).edit()
+            .putBoolean("gesture_wake_mode", enabled)
+            .putBoolean("listening", listeningEnabled)
+            .apply()
+        cancelSafewordSession()
+        if (!enabled && listeningEnabled && foreground) restartSafewordListening()
     }
 
     override fun onResume() {
         super.onResume()
         foreground = true
         checkBiometricAvailability()
-        gestureDetector.start()
-        if (!gestureWakeMode) startSafewordListening()
+        val sensorStarted = gestureDetector.start()
+        if (gestureWakeMode && !sensorStarted) {
+            gestureWakeMode = false
+            listeningEnabled = false
+            getSharedPreferences("shelter_prefs", MODE_PRIVATE).edit()
+                .putBoolean("gesture_wake_mode", false)
+                .putBoolean("listening", false)
+                .apply()
+            lifecycleScope.launch { snackbarHostState.showSnackbar("Gesture-Wake disabled because the accelerometer is unavailable") }
+        } else if (!gestureWakeMode) {
+            startSafewordListening()
+        }
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
@@ -413,9 +675,21 @@ class MainActivity : FragmentActivity() {
         if (requestCode == 10) {
             if (ActivityCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
                 listeningEnabled = false
+                if (pendingGestureEnable) {
+                    gestureWakeMode = false
+                    pendingGestureEnable = false
+                    getSharedPreferences("shelter_prefs", MODE_PRIVATE).edit()
+                        .putBoolean("gesture_wake_mode", false)
+                        .putBoolean("listening", false)
+                        .apply()
+                    lifecycleScope.launch { snackbarHostState.showSnackbar("Gesture-Wake needs microphone permission") }
+                }
+            } else if (pendingGestureEnable) {
+                updateGestureWakeMode(true)
             } else if (!gestureWakeMode) {
                 startSafewordListening()
             }
+            if (hasLocationPermission()) refreshCommunityLocation()
         }
     }
 
@@ -428,6 +702,7 @@ class MainActivity : FragmentActivity() {
             requestPermissionsIfNeeded()
             return
         }
+        stopEvidencePlayback()
         restartListeningJob?.cancel()
         safewordWindowJob?.cancel()
         safewordListeningActive = false
@@ -556,12 +831,11 @@ class MainActivity : FragmentActivity() {
             // Location is optional metadata. It must never block the
             // evidence row from appearing in the Vault or invalidate it.
             runCatching {
-                val (latitude, longitude) = getLocation()
-                lastLat = latitude
-                lastLng = longitude
-                if (latitude != null && longitude != null) {
+                getLocation()?.let { fix ->
+                    lastLat = fix.latitude
+                    lastLng = fix.longitude
                     withContext(Dispatchers.IO) {
-                        db.evidenceDao().updateLocation(sealed.entryId, latitude, longitude)
+                        db.evidenceDao().updateLocation(sealed.entryId, fix.latitude, fix.longitude)
                     }
                 }
             }
@@ -707,11 +981,9 @@ class MainActivity : FragmentActivity() {
         super.onStop()
         foreground = false
         gestureDetector.stop()
-        restartListeningJob?.cancel()
-        safewordWindowJob?.cancel()
+        cancelSafewordSession()
         communityLocationJob?.cancel()
-        speechRecognizer?.cancel()
-        safewordListeningActive = false
+        stopEvidencePlayback()
         // Re-lock the vault whenever the app leaves the foreground, so
         // background/multitasking can't be used to skip the biometric check.
         vaultUnlocked = false
@@ -857,38 +1129,166 @@ class MainActivity : FragmentActivity() {
         }
     }
 
+    private fun toggleEvidencePlayback(evidence: Evidence) {
+        if (!vaultUnlocked) return
+        val player = mediaPlayer
+        if (playbackState.evidenceId == evidence.id && playbackState.isPreparing) return
+        if (playbackState.evidenceId == evidence.id && player != null) {
+            if (runCatching { player.isPlaying }.getOrDefault(false)) {
+                runCatching { player.pause() }
+                playbackPositionJob?.cancel()
+                playbackState = playbackState.copy(isPlaying = false)
+            } else {
+                try {
+                    if (playbackState.durationMs > 0L && playbackState.positionMs >= playbackState.durationMs) {
+                        player.seekTo(0L, MediaPlayer.SEEK_CLOSEST)
+                        playbackState = playbackState.copy(positionMs = 0L)
+                    }
+                    player.start()
+                    playbackState = playbackState.copy(isPlaying = true)
+                    startPlaybackPositionUpdates(playbackRequestId)
+                } catch (e: Exception) {
+                    stopEvidencePlayback()
+                    lifecycleScope.launch { snackbarHostState.showSnackbar("Playback failed: ${e.message}") }
+                }
+            }
+            return
+        }
+        playEvidence(evidence)
+    }
+
     private fun playEvidence(evidence: Evidence) {
         if (!vaultUnlocked) return
-        lifecycleScope.launch {
-            val encryptedFile = File(filesDir, evidence.encryptedFile)
-            if (!encryptedFile.exists()) {
-                snackbarHostState.showSnackbar("Encrypted file not found")
-                return@launch
-            }
-            val tempAudio = File(cacheDir, "temp_play_${evidence.id}.m4a")
+        stopEvidencePlayback()
+        val encryptedFile = File(filesDir, evidence.encryptedFile)
+        if (!encryptedFile.exists()) {
+            lifecycleScope.launch { snackbarHostState.showSnackbar("Encrypted file not found") }
+            return
+        }
+
+        val requestId = ++playbackRequestId
+        val tempAudio = File(cacheDir, "temp_play_${evidence.id}_$requestId.m4a")
+        playbackState = EvidencePlaybackState(evidenceId = evidence.id, isPreparing = true)
+        playbackLoadJob = lifecycleScope.launch {
+            var playerOwnsTemp = false
             try {
-                Crypto.decrypt(encryptedFile, tempAudio, key)
-                mediaPlayer?.release()
-                mediaPlayer = MediaPlayer().apply {
-                    setDataSource(tempAudio.absolutePath)
-                    prepare()
-                    start()
-                    setOnCompletionListener { tempAudio.delete() }
+                withContext(Dispatchers.IO) {
+                    if (tempAudio.exists() && !tempAudio.delete()) throw IOException("Could not clear playback cache")
+                    Crypto.decrypt(encryptedFile, tempAudio, key)
                 }
-                snackbarHostState.showSnackbar("Playing evidence #${evidence.id}…")
+                if (requestId != playbackRequestId || !vaultUnlocked || !foreground) return@launch
+
+                val player = MediaPlayer()
+                mediaPlayer = player
+                playbackTempFile = tempAudio
+                player.setOnPreparedListener { prepared ->
+                    if (requestId != playbackRequestId || !vaultUnlocked || !foreground || mediaPlayer !== prepared) {
+                        releasePlaybackResources(prepared, tempAudio)
+                        return@setOnPreparedListener
+                    }
+                    try {
+                        val duration = prepared.duration.toLong().coerceAtLeast(0L)
+                        prepared.start()
+                        playbackState = EvidencePlaybackState(
+                            evidenceId = evidence.id,
+                            isPlaying = true,
+                            durationMs = duration
+                        )
+                        startPlaybackPositionUpdates(requestId)
+                    } catch (e: Exception) {
+                        stopEvidencePlayback()
+                        lifecycleScope.launch { snackbarHostState.showSnackbar("Playback failed: ${e.message}") }
+                    }
+                }
+                player.setOnCompletionListener { completed ->
+                    if (requestId != playbackRequestId || mediaPlayer !== completed) return@setOnCompletionListener
+                    playbackPositionJob?.cancel()
+                    playbackState = playbackState.copy(
+                        isPreparing = false,
+                        isPlaying = false,
+                        positionMs = playbackState.durationMs
+                    )
+                    releasePlaybackResources(completed, tempAudio)
+                }
+                player.setOnErrorListener { failed, _, _ ->
+                    if (requestId == playbackRequestId && mediaPlayer === failed) {
+                        releasePlaybackResources(failed, tempAudio)
+                        playbackState = EvidencePlaybackState()
+                        lifecycleScope.launch { snackbarHostState.showSnackbar("This evidence audio could not be played") }
+                    }
+                    true
+                }
+                player.setDataSource(tempAudio.absolutePath)
+                player.prepareAsync()
+                playerOwnsTemp = true
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (e: Exception) {
-                snackbarHostState.showSnackbar("Decryption failed: ${e.message}")
-                tempAudio.delete()
+                if (requestId == playbackRequestId) {
+                    playbackRequestId++
+                    playbackPositionJob?.cancel()
+                    playbackPositionJob = null
+                    mediaPlayer?.let { releasePlaybackResources(it, playbackTempFile) }
+                    playbackState = EvidencePlaybackState()
+                    snackbarHostState.showSnackbar("Decryption or playback failed: ${e.message}")
+                }
+            } finally {
+                if (!playerOwnsTemp) withContext(NonCancellable + Dispatchers.IO) { tempAudio.delete() }
             }
         }
+    }
+
+    private fun startPlaybackPositionUpdates(requestId: Long) {
+        playbackPositionJob?.cancel()
+        playbackPositionJob = lifecycleScope.launch {
+            while (requestId == playbackRequestId) {
+                delay(250L)
+                val player = mediaPlayer ?: return@launch
+                val isPlaying = runCatching { player.isPlaying }.getOrDefault(false)
+                if (!isPlaying) return@launch
+                val position = runCatching { player.currentPosition.toLong() }.getOrDefault(playbackState.positionMs)
+                playbackState = playbackState.copy(isPlaying = true, positionMs = position)
+            }
+        }
+    }
+
+    private fun seekEvidencePlayback(evidence: Evidence, positionMs: Long) {
+        if (!vaultUnlocked || playbackState.evidenceId != evidence.id) return
+        val player = mediaPlayer ?: return
+        val bounded = positionMs.coerceIn(0L, playbackState.durationMs)
+        try {
+            player.seekTo(bounded, MediaPlayer.SEEK_CLOSEST)
+            playbackState = playbackState.copy(positionMs = bounded)
+        } catch (e: Exception) {
+            lifecycleScope.launch { snackbarHostState.showSnackbar("Could not seek in this recording: ${e.message}") }
+        }
+    }
+
+    private fun stopEvidencePlayback() {
+        playbackRequestId++
+        playbackLoadJob?.cancel()
+        playbackLoadJob = null
+        playbackPositionJob?.cancel()
+        playbackPositionJob = null
+        mediaPlayer?.let { releasePlaybackResources(it, playbackTempFile) }
+        mediaPlayer = null
+        playbackTempFile?.delete()
+        playbackTempFile = null
+        playbackState = EvidencePlaybackState()
+    }
+
+    private fun releasePlaybackResources(player: MediaPlayer, tempAudio: File?) {
+        if (mediaPlayer === player) mediaPlayer = null
+        runCatching { player.release() }
+        tempAudio?.delete()
+        if (playbackTempFile == tempAudio) playbackTempFile = null
     }
 
     override fun onDestroy() {
         super.onDestroy()
         gestureDetector.stop()
         speechRecognizer?.destroy()
-        mediaPlayer?.release()
-        mediaPlayer = null
+        stopEvidencePlayback()
         analyzer.close()
     }
 }

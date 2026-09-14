@@ -41,6 +41,7 @@ import com.bithead.shelter.R
 import com.bithead.shelter.ai.IncidentSummary
 import com.bithead.shelter.data.Evidence
 import com.bithead.shelter.ui.components.EvidenceCard
+import com.bithead.shelter.ui.components.EvidencePlaybackState
 import com.bithead.shelter.ui.components.ListeningBars
 import com.bithead.shelter.ui.components.ThreatMeter
 import com.bithead.shelter.ui.theme.*
@@ -51,6 +52,8 @@ import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.math.abs
+import kotlin.math.cos
 
 private val tabs = listOf("Spaces", "Vault", "Community", "Support", "Settings")
 private val tabIcons = listOf(Icons.Outlined.Dashboard, Icons.Outlined.FolderSpecial, Icons.Outlined.NearMe, Icons.AutoMirrored.Outlined.HelpOutline, Icons.Outlined.Tune)
@@ -79,9 +82,31 @@ internal fun distanceMeters(lat1: Double, lng1: Double, lat2: Double, lng2: Doub
     return result[0].toDouble()
 }
 
-private val dangerZonesJson = JSONArray().apply {
-    check(sampleDangerZones.all { it.latitude in -90.0..90.0 && it.longitude in -180.0..180.0 && it.radiusMeters > 0 })
-    sampleDangerZones.forEach { zone ->
+private fun adaptiveDangerZones(latitude: Double?, longitude: Double?): List<MapDangerZone> {
+    if (latitude == null || longitude == null ||
+        !latitude.isFinite() || !longitude.isFinite() ||
+        distanceMeters(latitude, longitude, 28.6335, 77.2199) <= 50_000.0) {
+        return sampleDangerZones
+    }
+
+    fun shifted(northMeters: Double, eastMeters: Double, radius: Double, level: String, title: String, detail: String): MapDangerZone {
+        val lat = (latitude + northMeters / 111_320.0).coerceIn(-89.999, 89.999)
+        val longitudeScale = (111_320.0 * abs(cos(Math.toRadians(latitude)))).coerceAtLeast(1.0)
+        val rawLongitude = longitude + eastMeters / longitudeScale
+        val lng = ((rawLongitude + 540.0) % 360.0) - 180.0
+        return MapDangerZone(lat, lng, radius, level, title, detail)
+    }
+
+    return listOf(
+        shifted(120.0, 160.0, 340.0, "high", "Nearby incident cluster", "8 adaptive sample reports in this map area"),
+        shifted(-420.0, -250.0, 270.0, "medium", "Poorly lit stretch", "5 adaptive sample reports in this map area"),
+        shifted(480.0, -380.0, 230.0, "medium", "Isolated route", "3 adaptive sample reports in this map area")
+    )
+}
+
+private fun dangerZonesJson(zones: List<MapDangerZone>) = JSONArray().apply {
+    check(zones.all { it.latitude in -90.0..90.0 && it.longitude in -180.0..180.0 && it.radiusMeters > 0 })
+    zones.forEach { zone ->
         put(JSONObject()
             .put("lat", zone.latitude)
             .put("lng", zone.longitude)
@@ -96,12 +121,15 @@ private val dangerZonesJson = JSONArray().apply {
 fun VaaniApp(
     isEmergency: Boolean, isSealing: Boolean, safeword: String, threatLabel: String, threatScore: Int,
     lat: Double?, lng: Double?, evidence: List<Evidence>, vaultUnlocked: Boolean,
-    mapLat: Double?, mapLng: Double?,
+    mapLat: Double?, mapLng: Double?, mapAccuracyMeters: Float?, mapLocationTimestamp: Long?,
     biometricAvailable: Boolean, snackbarHostState: SnackbarHostState,
-    onTrigger: () -> Unit, onEditSafeword: () -> Unit, onPlay: (Evidence) -> Unit,
+    onTrigger: () -> Unit, onEditSafeword: () -> Unit,
+    playbackState: EvidencePlaybackState, onPlaybackToggle: (Evidence) -> Unit,
+    onPlaybackStop: () -> Unit, onPlaybackSeek: (Evidence, Long) -> Unit,
     onExport: (Evidence) -> Unit, onVerifyChain: () -> Unit, onUnlockVault: () -> Unit,
     listening: Boolean, listeningActive: Boolean, onListeningChange: (Boolean) -> Unit,
-    gestureWakeMode: Boolean, onGestureWakeModeChange: (Boolean) -> Unit, onLockVault: () -> Unit,
+    gestureWakeMode: Boolean, gestureWindowOpening: Boolean, gestureWindowSecondsRemaining: Int,
+    onGestureWakeModeChange: (Boolean) -> Unit, onLockVault: () -> Unit, onVaultHidden: () -> Unit,
     disguiseEnabled: Boolean, onDisguiseEnabledChange: (Boolean) -> Unit,
     onRefreshMapLocation: () -> Unit
 ) {
@@ -112,6 +140,9 @@ fun VaaniApp(
     var decoyDelay by rememberSaveable { mutableIntStateOf(0) }
     var decoyCall by rememberSaveable { mutableStateOf(false) }
     LaunchedEffect(disguiseEnabled) { disguised = disguiseEnabled }
+    LaunchedEffect(tab, disguised, blackout, vaultUnlocked) {
+        if (tab != 1 || disguised || blackout || !vaultUnlocked) onVaultHidden()
+    }
     LaunchedEffect(decoyDelay) {
         if (decoyDelay > 0) {
             delay(decoyDelay * 1000L)
@@ -171,11 +202,13 @@ fun VaaniApp(
         Box(Modifier.padding(padding)) {
             if (disguised) NotesScreen(unlockDisguise)
             else when (tab) {
-                0 -> Dashboard(isEmergency, isSealing, safeword, evidence.size, listening, listeningActive, gestureWakeMode, onListeningChange, onEditSafeword, onTrigger,
+                0 -> Dashboard(isEmergency, isSealing, safeword, evidence.size, listening, listeningActive, gestureWakeMode,
+                    gestureWindowOpening, gestureWindowSecondsRemaining, onListeningChange, onEditSafeword, onTrigger,
                     { tab = it }, disguise, { message = it }, decoyDelay, { decoyDelay = it })
                 1 -> Vault(isEmergency, isSealing, threatLabel, threatScore, lat, lng, evidence, vaultUnlocked, biometricAvailable,
-                    onTrigger, onUnlockVault, onVerifyChain, onPlay, onExport, { blackout = true })
-                2 -> Community(mapLat, mapLng, onRefreshMapLocation) { message = it }
+                    onTrigger, onUnlockVault, onVerifyChain, playbackState, onPlaybackToggle, onPlaybackStop,
+                    onPlaybackSeek, onExport, { blackout = true })
+                2 -> Community(mapLat, mapLng, mapAccuracyMeters, mapLocationTimestamp, onRefreshMapLocation) { message = it }
                 3 -> Support(disguise)
                 4 -> Settings(safeword, listening, onListeningChange, gestureWakeMode, onGestureWakeModeChange, onEditSafeword, disguiseEnabled, onDisguiseEnabledChange, disguise, { message = it })
             }
@@ -218,6 +251,7 @@ private fun Action(text: String, icon: ImageVector, onClick: () -> Unit, modifie
 
 @Composable
 private fun Dashboard(emergency: Boolean, isSealing: Boolean, safeword: String, count: Int, listening: Boolean, listeningActive: Boolean, gestureWakeMode: Boolean,
+    gestureWindowOpening: Boolean, gestureWindowSecondsRemaining: Int,
     onListen: (Boolean) -> Unit, onEdit: () -> Unit, onTrigger: () -> Unit, navigate: (Int) -> Unit,
     disguise: () -> Unit, info: (String) -> Unit, decoyDelay: Int, scheduleDecoy: (Int) -> Unit) {
     var confirm by remember { mutableStateOf(false) }
@@ -227,13 +261,13 @@ private fun Dashboard(emergency: Boolean, isSealing: Boolean, safeword: String, 
     LazyColumn(contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
         item { Panel { Row(verticalAlignment = Alignment.CenterVertically) {
             Icon(Icons.Outlined.Circle, null, Modifier.size(10.dp), ShelterSafe); Spacer(Modifier.width(10.dp))
-            Column(Modifier.weight(1f)) { Heading(if (isSealing) "Sealing evidence" else if (emergency) "Recording in progress" else if (listeningActive) "Safeword listening" else if (listening) "Safeword armed" else "Safeword paused"); Caption("Evidence stays on this device") }
+            Column(Modifier.weight(1f)) { Heading(if (isSealing) "Sealing evidence" else if (emergency) "Recording in progress" else if (listeningActive && gestureWakeMode) "Safeword listening • ${gestureWindowSecondsRemaining}s" else if (gestureWindowOpening) "Opening microphone…" else if (listening) "Safeword armed" else "Safeword paused"); Caption("Evidence stays on this device") }
             Badge("Local")
         } } }
         item { Panel(color = ShelterSurfaceRaised) {
-            Row(verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Outlined.Mic, null, tint = ShelterSafe); Spacer(Modifier.width(10.dp)); Text("ACOUSTIC SAFEWORD\nPROTOCOL", Modifier.weight(1f), style = MaterialTheme.typography.labelLarge); Badge(if (!listening) "Paused" else if (gestureWakeMode) "Stealth Active" else "Continuous Active") }
+            Row(verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Outlined.Mic, null, tint = ShelterSafe); Spacer(Modifier.width(10.dp)); Text("ACOUSTIC SAFEWORD\nPROTOCOL", Modifier.weight(1f), style = MaterialTheme.typography.labelLarge); Badge(if (!listening) "Paused" else if (gestureWindowOpening) "Opening" else if (gestureWakeMode && listeningActive) "Listening ${gestureWindowSecondsRemaining}s" else if (gestureWakeMode) "Gesture armed" else "Continuous Active") }
             ListeningBars(listening && (!gestureWakeMode || listeningActive), ShelterSafe, Modifier.align(Alignment.CenterHorizontally).height(32.dp))
-            Caption(if (gestureWakeMode) "Shake/jerk phone to open 5s listening window" else "Listens while app is foregrounded")
+            Caption(if (gestureWakeMode) "Shake/jerk phone to open a 12s listening window while this screen is open" else "Listens while app is foregrounded")
             Surface(onClick = onEdit, shape = RoundedCornerShape(12.dp), color = Color.White) {
                 Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) { Caption("Trigger phrase"); Heading("“$safeword”") }; Icon(Icons.Outlined.EditNote, "Edit safeword")
@@ -270,8 +304,9 @@ private fun Dashboard(emergency: Boolean, isSealing: Boolean, safeword: String, 
 
 @Composable
 private fun Vault(emergency: Boolean, isSealing: Boolean, label: String, score: Int, lat: Double?, lng: Double?, evidence: List<Evidence>, unlocked: Boolean,
-    biometric: Boolean, trigger: () -> Unit, unlock: () -> Unit, verify: () -> Unit, play: (Evidence) -> Unit,
-    export: (Evidence) -> Unit, blackout: () -> Unit) {
+    biometric: Boolean, trigger: () -> Unit, unlock: () -> Unit, verify: () -> Unit,
+    playback: EvidencePlaybackState, togglePlayback: (Evidence) -> Unit, stopPlayback: () -> Unit,
+    seekPlayback: (Evidence, Long) -> Unit, export: (Evidence) -> Unit, blackout: () -> Unit) {
     val dateFormat = remember { SimpleDateFormat("dd MMM, HH:mm", Locale.getDefault()) }
     var audioTab by rememberSaveable { mutableIntStateOf(0) }
     LazyColumn(contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
@@ -299,7 +334,24 @@ private fun Vault(emergency: Boolean, isSealing: Boolean, label: String, score: 
         } } else {
             item { Action("Verify chain integrity", Icons.Outlined.VerifiedUser, verify) }
             if (evidence.isEmpty()) item { Panel { Heading("No sealed recordings yet"); Caption("Record from Spaces, then stop and seal to create your first entry.") } }
-            items(evidence, key = { it.id }) { entry -> EvidenceCard(entry.id, dateFormat.format(Date(entry.createdAt)), entry.threatLabel, entry.threatScore, entry.latitude, entry.longitude, entry.sha256, entry.previousHash, IncidentSummary.describe(entry), { play(entry) }, { export(entry) }) }
+            items(evidence, key = { it.id }) { entry ->
+                EvidenceCard(
+                    index = entry.id,
+                    timestamp = dateFormat.format(Date(entry.createdAt)),
+                    threatLabel = entry.threatLabel,
+                    threatScore = entry.threatScore,
+                    lat = entry.latitude,
+                    lng = entry.longitude,
+                    chainHash = entry.sha256,
+                    previousHash = entry.previousHash,
+                    summary = IncidentSummary.describe(entry),
+                    playback = playback,
+                    onPlayPause = { togglePlayback(entry) },
+                    onStop = stopPlayback,
+                    onSeek = { seekPlayback(entry, it) },
+                    onExport = { export(entry) }
+                )
+            }
         }
     }
 }
@@ -338,16 +390,25 @@ private fun NotesScreen(unlock: () -> Unit) {
         confirmButton = { TextButton(onClick = { prefs.edit().putString("memo", note).apply(); editor = false }) { Text("Save") } })
 }
 
-private fun nearbyDangerZone(latitude: Double?, longitude: Double?): MapDangerZone? {
+private fun nearbyDangerZone(latitude: Double?, longitude: Double?, zones: List<MapDangerZone>): MapDangerZone? {
     if (latitude == null || longitude == null) return null
-    return sampleDangerZones
+    return zones
         .minByOrNull { distanceMeters(latitude, longitude, it.latitude, it.longitude) }
         ?.takeIf { distanceMeters(latitude, longitude, it.latitude, it.longitude) <= it.radiusMeters }
 }
 
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
-private fun LeafletMap(filter: String, latitude: Double?, longitude: Double?, modifier: Modifier = Modifier) {
+private fun LeafletMap(
+    filter: String,
+    latitude: Double?,
+    longitude: Double?,
+    accuracyMeters: Float?,
+    locationTimestamp: Long?,
+    zones: List<MapDangerZone>,
+    recenterRequest: Int,
+    modifier: Modifier = Modifier
+) {
     val context = LocalContext.current
     val webView = remember(context) {
         WebView(context).apply {
@@ -361,6 +422,9 @@ private fun LeafletMap(filter: String, latitude: Double?, longitude: Double?, mo
             webViewClient = object : WebViewClient() {
                 override fun onPageFinished(view: WebView, url: String) {
                     (view.tag as? String)?.let { view.evaluateJavascript(it, null) }
+                    view.post {
+                        view.evaluateJavascript("window.invalidateMapSize && window.invalidateMapSize();", null)
+                    }
                 }
 
                 override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean = true
@@ -369,10 +433,18 @@ private fun LeafletMap(filter: String, latitude: Double?, longitude: Double?, mo
         }
     }
     val validLocation = latitude?.isFinite() == true && longitude?.isFinite() == true
-    val script = remember(filter, latitude, longitude) {
+    val zonesJson = remember(zones) { dangerZonesJson(zones) }
+    val script = remember(filter, latitude, longitude, accuracyMeters, locationTimestamp, zonesJson, recenterRequest) {
         val lat = if (validLocation) latitude.toString() else "null"
         val lng = if (validLocation) longitude.toString() else "null"
-        "window.applyNativeState && window.applyNativeState(${JSONObject.quote(filter)}, $lat, $lng, $dangerZonesJson);"
+        val accuracy = accuracyMeters?.takeIf { it.isFinite() && it > 0f }?.toString() ?: "null"
+        val timestamp = locationTimestamp?.takeIf { it > 0L }?.toString() ?: "null"
+        buildString {
+            append("window.applyNativeState && window.applyNativeState(")
+            append(JSONObject.quote(filter)).append(", ").append(lat).append(", ").append(lng)
+            append(", ").append(accuracy).append(", ").append(timestamp).append(", ").append(zonesJson).append(");")
+            append("window.requestRecenter && window.requestRecenter(").append(recenterRequest).append(");")
+        }
     }
     DisposableEffect(webView) {
         onDispose {
@@ -387,28 +459,65 @@ private fun LeafletMap(filter: String, latitude: Double?, longitude: Double?, mo
                 view.tag = script
                 view.evaluateJavascript(script, null)
             }
+            // Compose can attach the WebView before its final measured size is
+            // available. Posting invalidation lets Leaflet recalculate after
+            // AndroidView has real bounds, including when returning to this tab.
+            view.post {
+                view.evaluateJavascript("window.invalidateMapSize && window.invalidateMapSize();", null)
+            }
+            view.postDelayed({
+                if (view.isAttachedToWindow) {
+                    view.evaluateJavascript("window.invalidateMapSize && window.invalidateMapSize();", null)
+                }
+            }, 150L)
         },
         modifier = modifier
     )
 }
 
 @Composable
-private fun Community(latitude: Double?, longitude: Double?, refreshLocation: () -> Unit, info: (String) -> Unit) {
+private fun Community(
+    latitude: Double?,
+    longitude: Double?,
+    accuracyMeters: Float?,
+    locationTimestamp: Long?,
+    refreshLocation: () -> Unit,
+    info: (String) -> Unit
+) {
     var filter by rememberSaveable { mutableStateOf("All Signals") }
     var factor by rememberSaveable { mutableStateOf("Dark stretch") }
     var reports by rememberSaveable { mutableIntStateOf(0) }
+    var recenterRequest by rememberSaveable { mutableIntStateOf(0) }
     val context = LocalContext.current
-    val nearbyZone = remember(latitude, longitude) { nearbyDangerZone(latitude, longitude) }
+    val zones = remember(latitude, longitude) { adaptiveDangerZones(latitude, longitude) }
+    val nearbyZone = remember(latitude, longitude, zones) { nearbyDangerZone(latitude, longitude, zones) }
     LaunchedEffect(Unit) { refreshLocation() }
     LaunchedEffect(nearbyZone?.title) {
         nearbyZone?.let { info("Caution: you are inside the sample ${it.title.lowercase()} zone. Check local conditions and choose a well-lit route.") }
     }
     LazyColumn(contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
-        item { Row(verticalAlignment = Alignment.CenterVertically) { Badge("Leaflet • sample incident history"); Spacer(Modifier.weight(1f)); TextButton(onClick = refreshLocation) { Text("Refresh location") } } }
+        item { Row(verticalAlignment = Alignment.CenterVertically) { Badge("Leaflet • adaptive sample incident history"); Spacer(Modifier.weight(1f)); Icon(Icons.Outlined.LocationOn, "Current location", tint = ShelterSafe) } }
         if (nearbyZone != null) item { Panel(color = Color(0xFFFFDAD6)) { Heading("Caution near ${nearbyZone.title.lowercase()}"); Caption("Your current location overlaps this sample risk area. Use the map to check a well-lit alternative.") } }
-        item { LeafletMap(filter, latitude, longitude, Modifier.fillMaxWidth().height(330.dp).clip(RoundedCornerShape(20.dp))) }
+        item {
+            LeafletMap(
+                filter,
+                latitude,
+                longitude,
+                accuracyMeters,
+                locationTimestamp,
+                zones,
+                recenterRequest,
+                Modifier.fillMaxWidth().height(330.dp).clip(RoundedCornerShape(20.dp))
+            )
+        }
+        item { Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            OutlinedButton(onClick = refreshLocation, modifier = Modifier.weight(1f)) { Icon(Icons.Outlined.Refresh, null); Spacer(Modifier.width(6.dp)); Text("Refresh") }
+            OutlinedButton(onClick = {
+                if (latitude != null && longitude != null) recenterRequest++ else refreshLocation()
+            }, modifier = Modifier.weight(1f)) { Icon(Icons.Outlined.MyLocation, null); Spacer(Modifier.width(6.dp)); Text("Recenter") }
+        } }
         item { Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) { listOf("All Signals", "Well-Lit Streets", "Patrol Points").forEach { label -> FilterChip(filter == label, { filter = label }, label = { Text(label) }) } } }
-        item { Panel { Heading("Safe Corridor Preview"); Badge("Sample data"); Panel(color = Color.White) { Heading("Suggested: Metro Boulevard"); Caption("Leaflet route overlay • no live safety score"); Action("Open device maps", Icons.Outlined.NearMe, { openLink(context, "geo:0,0?q=nearby+police+station") }) }; Caption("Map tiles require internet access. Route availability and local conditions must still be checked.") } }
+        item { Panel { Heading("Safe Corridor Preview"); Badge("Adaptive sample data"); Panel(color = Color.White) { Heading("Suggested: Nearby Well-Lit Corridor"); Caption("Leaflet route overlay near the current map area • no live safety score"); Action("Open device maps", Icons.Outlined.NearMe, { openLink(context, "geo:0,0?q=nearby+police+station") }) }; Caption("Map tiles require internet access. Route availability and local conditions must still be checked.") } }
         item { Heading("COMMUNITY OBSERVATIONS") }
         item { Panel { Heading("Night transit shuttle"); Caption("Sample • Gate 4 station, regular service"); HorizontalDivider(); Heading("Street lamp repaired"); Caption("Sample • Neighborhood maintenance update") } }
         item { Panel {
@@ -459,10 +568,10 @@ private fun Settings(safeword: String, listening: Boolean, onListen: (Boolean) -
             Row(verticalAlignment = Alignment.CenterVertically) { Text("Safeword Protection", Modifier.weight(1f)); Switch(listening, onListen) }
             HorizontalDivider()
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(if (gestureWakeMode) "Stealth Mode (Gesture-Wake 5s Window)" else "Continuous Listening", Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+                Text(if (gestureWakeMode) "Stealth Mode (Gesture-Wake 12s Window)" else "Continuous Listening", Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
                 Switch(gestureWakeMode, onGestureWakeModeChange)
             }
-            Caption("Stealth mode keeps the mic off until a physical jerk is detected, keeping the OS mic indicator hidden.")
+            Caption("Stealth mode keeps the mic off until a physical jerk is detected. Gesture detection works while VAANI or Notes is open in the foreground.")
             Caption("Offline recognition depends on your device.")
         } }
         item { Heading("DEVICE & VAULT SECURITY") }

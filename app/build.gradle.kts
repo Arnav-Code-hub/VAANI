@@ -49,6 +49,7 @@ dependencies {
     kapt("androidx.room:room-compiler:2.6.1")
     implementation("org.tensorflow:tensorflow-lite-task-audio:0.4.4")
     implementation("org.tensorflow:tensorflow-lite-task-audio")
+    testImplementation("junit:junit:4.13.2")
 
     // Jetpack Compose — polished, animated UI
     implementation(platform("androidx.compose:compose-bom:2024.09.00"))
