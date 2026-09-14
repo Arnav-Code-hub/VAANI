@@ -115,13 +115,16 @@ fun ListeningBars(active: Boolean, color: Color, modifier: Modifier = Modifier) 
     val bars = listOf(520, 380, 620, 440, 500)
     Row(modifier = modifier, verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
         bars.forEachIndexed { i, duration ->
-            val transition = rememberInfiniteTransition(label = "bar$i")
-            val height by transition.animateFloat(
-                initialValue = 6f,
-                targetValue = if (active) 26f else 6f,
-                animationSpec = infiniteRepeatable(tween(duration, easing = LinearEasing), RepeatMode.Reverse),
-                label = "barHeight$i"
-            )
+            val height = if (active) {
+                val transition = rememberInfiniteTransition(label = "bar$i")
+                val animatedHeight by transition.animateFloat(
+                    initialValue = 6f,
+                    targetValue = 26f,
+                    animationSpec = infiniteRepeatable(tween(duration, easing = LinearEasing), RepeatMode.Reverse),
+                    label = "barHeight$i"
+                )
+                animatedHeight
+            } else 6f
             Box(
                 modifier = Modifier
                     .width(4.dp)
