@@ -5,22 +5,45 @@
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+    <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.INTERNET" />
 
     <application
         android:theme="@style/Theme.SHELTER"
-        android:label="SHELTER"
+        android:label="VAANI"
+        android:icon="@drawable/vaani_mark"
         android:allowBackup="false"
         android:supportsRtl="true">
 
         <activity
             android:name=".MainActivity"
-            android:exported="true">
+            android:exported="false" />
+
+        <activity-alias
+            android:name=".VaaniAlias"
+            android:enabled="true"
+            android:exported="true"
+            android:icon="@drawable/vaani_mark"
+            android:label="VAANI"
+            android:targetActivity=".MainActivity">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN"/>
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
-        </activity>
+        </activity-alias>
+
+        <activity-alias
+            android:name=".NotesAlias"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@drawable/ic_notes_launcher"
+            android:label="Notes"
+            android:targetActivity=".MainActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+        </activity-alias>
 
         <provider
             android:name="androidx.core.content.FileProvider"

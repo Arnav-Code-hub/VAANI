@@ -11,6 +11,7 @@ import android.webkit.WebViewClient
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.*
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -29,6 +30,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
@@ -43,6 +45,7 @@ import com.bithead.shelter.ui.components.ListeningBars
 import com.bithead.shelter.ui.components.ThreatMeter
 import com.bithead.shelter.ui.theme.*
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 import java.text.SimpleDateFormat
@@ -51,6 +54,9 @@ import java.util.Locale
 
 private val tabs = listOf("Spaces", "Vault", "Community", "Support", "Settings")
 private val tabIcons = listOf(Icons.Outlined.Dashboard, Icons.Outlined.FolderSpecial, Icons.Outlined.NearMe, Icons.AutoMirrored.Outlined.HelpOutline, Icons.Outlined.Tune)
+private val disguisePasscodes = setOf("##", "vaani", "911").also {
+    check(it.size == 3 && it.all(String::isNotBlank))
+}
 
 internal data class MapDangerZone(
     val latitude: Double,
@@ -88,21 +94,24 @@ private val dangerZonesJson = JSONArray().apply {
 
 @Composable
 fun VaaniApp(
-    isEmergency: Boolean, safeword: String, threatLabel: String, threatScore: Int,
+    isEmergency: Boolean, isSealing: Boolean, safeword: String, threatLabel: String, threatScore: Int,
     lat: Double?, lng: Double?, evidence: List<Evidence>, vaultUnlocked: Boolean,
     mapLat: Double?, mapLng: Double?,
     biometricAvailable: Boolean, snackbarHostState: SnackbarHostState,
     onTrigger: () -> Unit, onEditSafeword: () -> Unit, onPlay: (Evidence) -> Unit,
     onExport: (Evidence) -> Unit, onVerifyChain: () -> Unit, onUnlockVault: () -> Unit,
-    listening: Boolean, onListeningChange: (Boolean) -> Unit, onLockVault: () -> Unit,
+    listening: Boolean, listeningActive: Boolean, onListeningChange: (Boolean) -> Unit,
+    gestureWakeMode: Boolean, onGestureWakeModeChange: (Boolean) -> Unit, onLockVault: () -> Unit,
+    disguiseEnabled: Boolean, onDisguiseEnabledChange: (Boolean) -> Unit,
     onRefreshMapLocation: () -> Unit
 ) {
     var tab by rememberSaveable { mutableIntStateOf(0) }
-    var disguised by rememberSaveable { mutableStateOf(false) }
+    var disguised by rememberSaveable { mutableStateOf(disguiseEnabled) }
     var blackout by remember { mutableStateOf(false) }
     var message by remember { mutableStateOf<String?>(null) }
     var decoyDelay by rememberSaveable { mutableIntStateOf(0) }
     var decoyCall by rememberSaveable { mutableStateOf(false) }
+    LaunchedEffect(disguiseEnabled) { disguised = disguiseEnabled }
     LaunchedEffect(decoyDelay) {
         if (decoyDelay > 0) {
             delay(decoyDelay * 1000L)
@@ -111,8 +120,9 @@ fun VaaniApp(
         }
     }
     val disguise = { onLockVault(); disguised = true }
+    val unlockDisguise = { disguised = false }
     BackHandler(blackout || disguised || tab != 0) {
-        when { blackout -> blackout = false; disguised -> disguised = false; else -> tab = 0 }
+        when { blackout -> blackout = false; disguised -> Unit; else -> tab = 0 }
     }
     if (blackout) {
         Box(Modifier.fillMaxSize().background(Color.Black)) {
@@ -127,15 +137,25 @@ fun VaaniApp(
         snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
             Row(Modifier.statusBarsPadding().fillMaxWidth().padding(horizontal = 12.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-                IconButton(onClick = { if (disguised) disguised = false else disguise() }) {
-                    Icon(if (disguised) Icons.Outlined.FolderOpen else Icons.Outlined.Calculate, if (disguised) "Open safety dashboard" else "Show notes disguise")
+                if (disguised) {
+                    Column(
+                        Modifier.weight(1f).pointerInput(Unit) {
+                            detectTapGestures(onPress = {
+                                if (withTimeoutOrNull(2_000L) { tryAwaitRelease() } == null) unlockDisguise()
+                            })
+                        }
+                    ) {
+                        Text("PERSONAL", style = MaterialTheme.typography.labelMedium, color = ShelterTextDim)
+                        Text("All Notes", style = MaterialTheme.typography.titleLarge)
+                    }
+                } else {
+                    IconButton(onClick = disguise) { Icon(Icons.Outlined.Calculate, "Show notes disguise") }
+                    Column(Modifier.weight(1f).padding(start = 8.dp)) {
+                        Text("VAANI", style = MaterialTheme.typography.labelMedium, color = ShelterTextDim)
+                        Text(listOf("Spaces / Home", "Evidence / Vault", "Community Routes", "Support Network", "Discreet Settings")[tab], style = MaterialTheme.typography.titleLarge)
+                    }
+                    Image(painterResource(R.drawable.vaani_mark), "VAANI", Modifier.size(44.dp).clip(CircleShape))
                 }
-                Column(Modifier.weight(1f).padding(start = 8.dp)) {
-                    Text(if (disguised) "PERSONAL" else "VAANI", style = MaterialTheme.typography.labelMedium, color = ShelterTextDim)
-                    Text(if (disguised) "All Notes" else listOf("Spaces / Home", "Evidence / Vault", "Community Routes", "Support Network", "Discreet Settings")[tab], style = MaterialTheme.typography.titleLarge)
-                }
-                if (disguised) IconButton(onClick = { disguised = false }) { Icon(Icons.Outlined.Calculate, "Open safety dashboard") }
-                else Image(painterResource(R.drawable.vaani_mark), "SHELTER VAANI", Modifier.size(44.dp).clip(CircleShape))
             }
         },
         bottomBar = {
@@ -149,15 +169,15 @@ fun VaaniApp(
         }
     ) { padding ->
         Box(Modifier.padding(padding)) {
-            if (disguised) NotesScreen()
+            if (disguised) NotesScreen(unlockDisguise)
             else when (tab) {
-                0 -> Dashboard(isEmergency, safeword, evidence.size, listening, onListeningChange, onEditSafeword, onTrigger,
+                0 -> Dashboard(isEmergency, isSealing, safeword, evidence.size, listening, listeningActive, gestureWakeMode, onListeningChange, onEditSafeword, onTrigger,
                     { tab = it }, disguise, { message = it }, decoyDelay, { decoyDelay = it })
-                1 -> Vault(isEmergency, threatLabel, threatScore, lat, lng, evidence, vaultUnlocked, biometricAvailable,
+                1 -> Vault(isEmergency, isSealing, threatLabel, threatScore, lat, lng, evidence, vaultUnlocked, biometricAvailable,
                     onTrigger, onUnlockVault, onVerifyChain, onPlay, onExport, { blackout = true })
                 2 -> Community(mapLat, mapLng, onRefreshMapLocation) { message = it }
                 3 -> Support(disguise)
-                4 -> Settings(safeword, listening, onListeningChange, onEditSafeword, disguise, { message = it })
+                4 -> Settings(safeword, listening, onListeningChange, gestureWakeMode, onGestureWakeModeChange, onEditSafeword, disguiseEnabled, onDisguiseEnabledChange, disguise, { message = it })
             }
         }
     }
@@ -188,8 +208,8 @@ private fun Badge(text: String) {
 }
 
 @Composable
-private fun Action(text: String, icon: ImageVector, onClick: () -> Unit, modifier: Modifier = Modifier, primary: Boolean = true) {
-    Button(onClick = onClick, modifier = modifier.fillMaxWidth().heightIn(min = 52.dp), shape = RoundedCornerShape(12.dp),
+private fun Action(text: String, icon: ImageVector, onClick: () -> Unit, modifier: Modifier = Modifier, primary: Boolean = true, enabled: Boolean = true) {
+    Button(onClick = onClick, enabled = enabled, modifier = modifier.fillMaxWidth().heightIn(min = 52.dp), shape = RoundedCornerShape(12.dp),
         colors = ButtonDefaults.buttonColors(containerColor = if (primary) ShelterSafe else ShelterSurfaceRaised,
             contentColor = if (primary) Color.White else MaterialTheme.colorScheme.onSurface)) {
         Icon(icon, null, Modifier.size(20.dp)); Spacer(Modifier.width(8.dp)); Text(text)
@@ -197,30 +217,39 @@ private fun Action(text: String, icon: ImageVector, onClick: () -> Unit, modifie
 }
 
 @Composable
-private fun Dashboard(emergency: Boolean, safeword: String, count: Int, listening: Boolean,
+private fun Dashboard(emergency: Boolean, isSealing: Boolean, safeword: String, count: Int, listening: Boolean, listeningActive: Boolean, gestureWakeMode: Boolean,
     onListen: (Boolean) -> Unit, onEdit: () -> Unit, onTrigger: () -> Unit, navigate: (Int) -> Unit,
     disguise: () -> Unit, info: (String) -> Unit, decoyDelay: Int, scheduleDecoy: (Int) -> Unit) {
     var confirm by remember { mutableStateOf(false) }
+    LaunchedEffect(emergency, isSealing) {
+        if (emergency || isSealing) confirm = false
+    }
     LazyColumn(contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
         item { Panel { Row(verticalAlignment = Alignment.CenterVertically) {
             Icon(Icons.Outlined.Circle, null, Modifier.size(10.dp), ShelterSafe); Spacer(Modifier.width(10.dp))
-            Column(Modifier.weight(1f)) { Heading(if (emergency) "Recording in progress" else if (listening) "Safeword listening" else "Safeword paused"); Caption("Evidence stays on this device") }
+            Column(Modifier.weight(1f)) { Heading(if (isSealing) "Sealing evidence" else if (emergency) "Recording in progress" else if (listeningActive) "Safeword listening" else if (listening) "Safeword armed" else "Safeword paused"); Caption("Evidence stays on this device") }
             Badge("Local")
         } } }
         item { Panel(color = ShelterSurfaceRaised) {
-            Row(verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Outlined.Mic, null, tint = ShelterSafe); Spacer(Modifier.width(10.dp)); Text("ACOUSTIC SAFEWORD\nPROTOCOL", Modifier.weight(1f), style = MaterialTheme.typography.labelLarge); Badge(if (listening) "Listen" else "Paused") }
+            Row(verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Outlined.Mic, null, tint = ShelterSafe); Spacer(Modifier.width(10.dp)); Text("ACOUSTIC SAFEWORD\nPROTOCOL", Modifier.weight(1f), style = MaterialTheme.typography.labelLarge); Badge(if (!listening) "Paused" else if (gestureWakeMode) "Stealth Active" else "Continuous Active") }
+            ListeningBars(listening && (!gestureWakeMode || listeningActive), ShelterSafe, Modifier.align(Alignment.CenterHorizontally).height(32.dp))
+            Caption(if (gestureWakeMode) "Shake/jerk phone to open 5s listening window" else "Listens while app is foregrounded")
             Surface(onClick = onEdit, shape = RoundedCornerShape(12.dp), color = Color.White) {
                 Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) { Caption("Trigger phrase"); Heading("“$safeword”") }; Icon(Icons.Outlined.EditNote, "Edit safeword")
                 }
             }
-            Row(verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Outlined.GraphicEq, null); Text("Listen while app is open", Modifier.weight(1f).padding(horizontal = 8.dp), style = MaterialTheme.typography.bodyMedium); Switch(listening, onListen, enabled = !emergency) }
+            Row(verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Outlined.GraphicEq, null); Text("Safeword Protection", Modifier.weight(1f).padding(horizontal = 8.dp), style = MaterialTheme.typography.bodyMedium); Switch(listening, onListen, enabled = !emergency && !isSealing) }
         } }
         item { Panel(color = Color(0xFF31312D)) {
             Icon(Icons.Outlined.VerifiedUser, null, Modifier.align(Alignment.CenterHorizontally).size(40.dp), ShelterSafeSoft)
-            Text(if (emergency) "Your recording is running" else "Your quiet safety shield", Modifier.align(Alignment.CenterHorizontally), style = MaterialTheme.typography.headlineSmall, color = Color.White)
+            Text(if (isSealing) "Encrypting and sealing evidence…" else if (emergency) "Your recording is running" else "Your quiet safety shield", Modifier.align(Alignment.CenterHorizontally), style = MaterialTheme.typography.headlineSmall, color = Color.White)
             Text("Capture audio locally, then seal it with encryption and a tamper-evident record.", color = Color(0xFFC1C8C3), style = MaterialTheme.typography.bodyMedium)
-            Action(if (emergency) "Stop & seal evidence" else "Engage Silent Shield", Icons.Outlined.Shield, { if (emergency) onTrigger() else confirm = true })
+            when {
+                isSealing -> Action("Sealing evidence…", Icons.Outlined.Lock, {}, enabled = false)
+                emergency -> Action("Stop & seal evidence", Icons.Outlined.Shield, onTrigger)
+                else -> Action("Engage Silent Shield", Icons.Outlined.Shield, { confirm = true })
+            }
             Text("Local capture • does not dispatch help", color = Color(0xFFC1C8C3), style = MaterialTheme.typography.labelMedium)
         } }
         item { Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -233,14 +262,14 @@ private fun Dashboard(emergency: Boolean, safeword: String, count: Int, listenin
             Panel(Modifier.weight(1f)) { Icon(Icons.Outlined.HealthAndSafety, null, tint = ShelterSafe); Heading("Safe Haven"); Caption("Explore community routes"); Action("Wayfinder", Icons.Outlined.NearMe, { navigate(2) }, primary = false) }
         } }
         item { Panel { Heading("Community outposts"); Caption("Preview nearby support locations and route information."); Badge("Sample map • not live"); Action("Explore routes", Icons.Outlined.Map, { navigate(2) }, primary = false) } }
-        item { Action("Switch to notes disguise", Icons.Outlined.VisibilityOff, disguise, primary = false) }
+        item { Action("Lock to Notes", Icons.Outlined.VisibilityOff, disguise, primary = false) }
     }
-    if (confirm) AlertDialog(onDismissRequest = { confirm = false }, title = { Text("Start local recording?") }, text = { Text("Audio is recorded on this device. Stop and seal it in the vault. No emergency services or contacts will be notified.") },
+    if (confirm && !emergency && !isSealing) AlertDialog(onDismissRequest = { confirm = false }, title = { Text("Start local recording?") }, text = { Text("Audio is recorded on this device. Stop and seal it in the vault. No emergency services or contacts will be notified.") },
         confirmButton = { TextButton(onClick = { confirm = false; onTrigger() }) { Text("Start recording") } }, dismissButton = { TextButton(onClick = { confirm = false }) { Text("Cancel") } })
 }
 
 @Composable
-private fun Vault(emergency: Boolean, label: String, score: Int, lat: Double?, lng: Double?, evidence: List<Evidence>, unlocked: Boolean,
+private fun Vault(emergency: Boolean, isSealing: Boolean, label: String, score: Int, lat: Double?, lng: Double?, evidence: List<Evidence>, unlocked: Boolean,
     biometric: Boolean, trigger: () -> Unit, unlock: () -> Unit, verify: () -> Unit, play: (Evidence) -> Unit,
     export: (Evidence) -> Unit, blackout: () -> Unit) {
     val dateFormat = remember { SimpleDateFormat("dd MMM, HH:mm", Locale.getDefault()) }
@@ -248,10 +277,10 @@ private fun Vault(emergency: Boolean, label: String, score: Int, lat: Double?, l
     LazyColumn(contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
         item { Panel { Row(verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Outlined.Lock, null, tint = ShelterSafe); Spacer(Modifier.width(12.dp)); Column(Modifier.weight(1f)) { Heading("Stealth Evidence Vault"); Caption("On-device • AES-256-GCM") }; Badge(if (unlocked) "Unlocked" else "Locked") } } }
         item { Panel(color = ShelterSurfaceRaised) {
-            Heading(if (emergency) "MIC RECORDING" else "LOCAL CAPTURE")
+            Heading(if (isSealing) "SEALING EVIDENCE" else if (emergency) "MIC RECORDING" else "LOCAL CAPTURE")
             ListeningBars(emergency, ShelterSafe, Modifier.align(Alignment.CenterHorizontally).height(40.dp))
-            Text(if (emergency) "Recording…" else "Ready when you are", Modifier.align(Alignment.CenterHorizontally), style = MaterialTheme.typography.headlineSmall)
-            Caption(if (emergency) "Auto-seals after 5 minutes" else "Start recording from Spaces")
+            Text(if (isSealing) "Encrypting and committing…" else if (emergency) "Recording…" else "Ready when you are", Modifier.align(Alignment.CenterHorizontally), style = MaterialTheme.typography.headlineSmall)
+            Caption(if (isSealing) "New recordings are blocked until sealing finishes" else if (emergency) "Auto-seals after 5 minutes" else "Start recording from Spaces")
             TabRow(selectedTabIndex = audioTab, containerColor = ShelterSurfaceRaised) {
                 listOf("Audio", "Location").forEachIndexed { i, title -> Tab(audioTab == i, onClick = { audioTab = i }, text = { Text(title) }) }
             }
@@ -259,6 +288,7 @@ private fun Vault(emergency: Boolean, label: String, score: Int, lat: Double?, l
         } }
         item { Action("Blackout display", Icons.Outlined.VisibilityOff, blackout, primary = false) }
         if (emergency) item { Action("Stop & seal vault", Icons.Outlined.Lock, trigger) }
+        if (isSealing) item { Action("Sealing evidence…", Icons.Outlined.Lock, {}, enabled = false) }
         item { Panel { Heading("Offline first storage"); Caption("Sealed recordings stay on this device. Unlock to play or export a chain-of-custody record. No cloud or peer sync is connected.") } }
         item { Heading("ENCRYPTED EVIDENCE LOG") }
         if (!unlocked) item { Panel(color = Color.White) {
@@ -275,7 +305,7 @@ private fun Vault(emergency: Boolean, label: String, score: Int, lat: Double?, l
 }
 
 @Composable
-private fun NotesScreen() {
+private fun NotesScreen(unlock: () -> Unit) {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("vaani_notes", 0) }
     var query by rememberSaveable { mutableStateOf("") }
@@ -286,7 +316,12 @@ private fun NotesScreen() {
     val checked = remember { mutableStateListOf(*Array(5) { prefs.getBoolean("grocery_$it", it < 2) }) }
     fun matches(title: String, group: String) = (category == "All Notes" || category == group) && title.contains(query, true)
     LazyColumn(contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-        item { OutlinedTextField(query, { query = it }, Modifier.fillMaxWidth(), placeholder = { Text("Search memos, recipes, lists…") }, leadingIcon = { Icon(Icons.Outlined.Search, null) }, shape = RoundedCornerShape(16.dp), singleLine = true) }
+        item { OutlinedTextField(query, { value ->
+            if (value.trim().lowercase(Locale.ROOT) in disguisePasscodes) {
+                query = ""
+                unlock()
+            } else query = value
+        }, Modifier.fillMaxWidth(), placeholder = { Text("Search memos, recipes, lists…") }, leadingIcon = { Icon(Icons.Outlined.Search, null) }, shape = RoundedCornerShape(16.dp), singleLine = true) }
         item { Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) { listOf("All Notes", "Groceries", "Reading", "Work Sync").forEach { label -> FilterChip(category == label, { category = label }, label = { Text(label) }) } } }
         if (matches("Weekly Grocery & Market", "Groceries")) item { Panel {
             Heading("Weekly Grocery & Market"); Caption("Items for Saturday brunch prep & weekly staples from the corner market.")
@@ -410,17 +445,38 @@ private fun Support(disguise: () -> Unit) {
 }
 
 @Composable
-private fun Settings(safeword: String, listening: Boolean, onListen: (Boolean) -> Unit, edit: () -> Unit, disguise: () -> Unit, info: (String) -> Unit) {
+private fun Settings(safeword: String, listening: Boolean, onListen: (Boolean) -> Unit,
+    gestureWakeMode: Boolean, onGestureWakeModeChange: (Boolean) -> Unit, edit: () -> Unit,
+    disguiseEnabled: Boolean, onDisguiseEnabledChange: (Boolean) -> Unit, disguise: () -> Unit, info: (String) -> Unit) {
     val context = LocalContext.current
     LazyColumn(contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
         item { Panel { Heading("Protection preferences"); Caption("Local capture • notes disguise"); Badge(if (listening) "Listening" else "Paused") } }
         item { Heading("ACOUSTIC TRIGGER") }
-        item { Panel(color = Color.White) { Caption("Current safeword phrase"); Heading("“$safeword”"); Action("Edit safeword", Icons.Outlined.Edit, edit, primary = false); Caption("Listens while the app is open. Offline recognition depends on your device."); Row(verticalAlignment = Alignment.CenterVertically) { Text("Safeword listening", Modifier.weight(1f)); Switch(listening, onListen) } } }
+        item { Panel(color = Color.White) {
+            Caption("Current safeword phrase")
+            Heading("“$safeword”")
+            Action("Edit safeword", Icons.Outlined.Edit, edit, primary = false)
+            Row(verticalAlignment = Alignment.CenterVertically) { Text("Safeword Protection", Modifier.weight(1f)); Switch(listening, onListen) }
+            HorizontalDivider()
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(if (gestureWakeMode) "Stealth Mode (Gesture-Wake 5s Window)" else "Continuous Listening", Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+                Switch(gestureWakeMode, onGestureWakeModeChange)
+            }
+            Caption("Stealth mode keeps the mic off until a physical jerk is detected, keeping the OS mic indicator hidden.")
+            Caption("Offline recognition depends on your device.")
+        } }
         item { Heading("DEVICE & VAULT SECURITY") }
         item { Panel { Heading("Biometric vault lock"); Caption("Uses your device fingerprint, face, or screen lock. The vault locks when the app leaves the foreground."); Action("Device security settings", Icons.Outlined.Fingerprint, { context.startActivity(Intent(android.provider.Settings.ACTION_SECURITY_SETTINGS)) }, primary = false) } }
         item { Panel { Heading("Hardware & background triggers"); Caption("Power-button triggers, face-down detection, Bluetooth relay, and background monitoring are not connected in this prototype."); Badge("Preview only"); Action("View planned triggers", Icons.Outlined.Sensors, { info("Planned: hardware gestures, low-battery save, nighttime checks and Bluetooth relay. These features are not active and cannot dispatch help.") }, primary = false) } }
         item { Heading("DECOY APP PERSONA") }
-        item { Panel(color = Color.White) { Heading("Daily Notes"); Caption("A working notes screen with a grocery checklist and your own memo. Tap the calculator icon to return to VAANI."); Action("Open notes disguise", Icons.Outlined.EditNote, disguise); Caption("Changes the screen inside VAANI; the launcher name and icon stay unchanged.") } }
+        item { Panel(color = Color.White) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Disguise as Notes App", Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
+                Switch(disguiseEnabled, onDisguiseEnabledChange)
+            }
+            Caption(if (disguiseEnabled) "The launcher appears as Notes and future launches open All Notes." else "The launcher appears as VAANI and opens the safety dashboard.")
+            Action("Lock to Notes now", Icons.Outlined.VisibilityOff, disguise, primary = false)
+        } }
         item { Heading("LANGUAGE & DISPATCH") }
         item { Panel { Heading("English interface"); Caption("Speech recognition uses your device language. Translated screens and SMS dispatch are not connected.") } }
         item { Action("Test interface quietly", Icons.Outlined.CheckCircleOutline, { info("Interface check complete. No recording was started and no contacts were notified. To test real recording, use Engage Silent Shield on Spaces.") }) }

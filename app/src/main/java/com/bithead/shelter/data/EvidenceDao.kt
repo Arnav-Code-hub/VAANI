@@ -3,6 +3,8 @@ package com.bithead.shelter.data
 import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.Query
+import androidx.room.Transaction
+import com.bithead.shelter.security.Crypto
 import kotlinx.coroutines.flow.Flow
 
 @Dao
@@ -11,4 +13,20 @@ interface EvidenceDao {
     @Query("SELECT * FROM evidence ORDER BY id DESC") fun observeAll(): Flow<List<Evidence>>
     @Query("SELECT * FROM evidence ORDER BY id DESC LIMIT 1") suspend fun latest(): Evidence?
     @Query("SELECT * FROM evidence ORDER BY id ASC") suspend fun allAscending(): List<Evidence>
+    @Query("SELECT encryptedFile FROM evidence") suspend fun allEncryptedFileNames(): List<String>
+    @Query("SELECT id FROM evidence WHERE encryptedFile = :fileName LIMIT 1")
+    suspend fun entryIdForFile(fileName: String): Long?
+    @Query("UPDATE evidence SET latitude = :latitude, longitude = :longitude WHERE id = :id")
+    suspend fun updateLocation(id: Long, latitude: Double, longitude: Double)
+
+    @Transaction
+    suspend fun insertChained(item: Evidence, encryptedFileHash: String): Long {
+        val previous = latest()?.sha256
+        return insert(
+            item.copy(
+                sha256 = Crypto.chainHash(encryptedFileHash, previous),
+                previousHash = previous
+            )
+        )
+    }
 }

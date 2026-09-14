@@ -4,6 +4,7 @@ import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
 import java.io.File
+import java.io.FileOutputStream
 import java.nio.charset.StandardCharsets
 import java.security.KeyStore
 import java.security.MessageDigest
@@ -54,8 +55,11 @@ object Crypto {
         cipher.init(Cipher.ENCRYPT_MODE, key, GCMParameterSpec(128, iv))
         val plaintext = input.readBytes()
         val ciphertext = cipher.doFinal(plaintext)
-        output.writeBytes(iv + ciphertext)
-        input.delete() // Automatically purges raw cache file after encryption
+        FileOutputStream(output).use { stream ->
+            stream.write(iv)
+            stream.write(ciphertext)
+            stream.fd.sync()
+        }
     }
 
     fun decrypt(input: File, output: File, key: SecretKey) {
