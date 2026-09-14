@@ -1,6 +1,6 @@
-# SHELTER — Android Hackathon Prototype
+# VAANI — Android Hackathon Prototype
 
-SHELTER is a privacy-first emergency safety prototype: a spoken safeword triggers
+VAANI is a privacy-first emergency safety prototype: a spoken safeword triggers
 encrypted, tamper-evident audio evidence capture, entirely stored on-device.
 
 ## What is implemented
