@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data: https://*.tile.openstreetmap.org; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'">
+    <link rel="stylesheet" href="leaflet/leaflet.css">
+    <style>
+        html, body, #map { width: 100%; height: 100%; margin: 0; background: #e4ebdf; }
+        body { font-family: system-ui, sans-serif; }
+        .legend {
+            background: rgba(252, 249, 243, .94);
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(28, 28, 24, .18);
+            color: #1c1c18;
+            font-size: 12px;
+            line-height: 20px;
+            padding: 8px 10px;
+        }
+        .legend i { border-radius: 50%; display: inline-block; height: 10px; margin-right: 7px; width: 10px; }
+        .leaflet-popup-content-wrapper, .leaflet-popup-tip { background: #fcf9f3; color: #1c1c18; }
+        .leaflet-control-attribution { font-size: 9px; }
+    </style>
+</head>
+<body>
+<div id="map" aria-label="Interactive community safety map"></div>
+<script src="leaflet/leaflet.js"></script>
+<script>
+    const map = L.map('map', { zoomControl: true }).setView([28.6315, 77.2167], 13);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19,
+        attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+
+    const riskLayer = L.layerGroup().addTo(map);
+    const corridorLayer = L.layerGroup().addTo(map);
+    const patrolLayer = L.layerGroup().addTo(map);
+    let userMarker = null;
+
+    L.polyline([
+        [28.6208, 77.2100], [28.6250, 77.2130], [28.6305, 77.2180], [28.6375, 77.2240], [28.6430, 77.2290]
+    ], { color: '#204637', weight: 7, opacity: .9 }).bindPopup('<strong>Well-lit corridor</strong><br>Sample community route').addTo(corridorLayer);
+
+    [
+        [28.6282, 77.2128, 'Patrolled point · Central market'],
+        [28.6390, 77.2260, 'Patrolled point · Metro gate'],
+        [28.6198, 77.2204, 'Verified haven · 24-hour pharmacy']
+    ].forEach(point => {
+        L.circleMarker([point[0], point[1]], {
+            radius: 8, color: '#52606a', fillColor: '#d3e2ed', fillOpacity: 1, weight: 3
+        }).bindPopup(`<strong>${point[2]}</strong><br><small>Sample support location</small>`).addTo(patrolLayer);
+    });
+
+    const legend = L.control({ position: 'bottomleft' });
+    legend.onAdd = function () {
+        const box = L.DomUtil.create('div', 'legend');
+        box.innerHTML = '<div><i style="background:#b3261e"></i>Higher reported risk</div>' +
+            '<div><i style="background:#d97706"></i>Moderate reported risk</div>' +
+            '<div><i style="background:#204637"></i>Well-lit corridor</div>';
+        return box;
+    };
+    legend.addTo(map);
+
+    window.setDangerZones = function (zones) {
+        riskLayer.clearLayers();
+        if (!Array.isArray(zones)) return;
+        zones.filter(zone => Number.isFinite(zone.lat) && zone.lat >= -90 && zone.lat <= 90 &&
+            Number.isFinite(zone.lng) && zone.lng >= -180 && zone.lng <= 180 &&
+            Number.isFinite(zone.radius) && zone.radius > 0).forEach(zone => {
+            const color = zone.level === 'high' ? '#b3261e' : '#d97706';
+            const popup = document.createElement('div');
+            const title = document.createElement('strong');
+            const detail = document.createElement('div');
+            const source = document.createElement('small');
+            title.textContent = zone.title;
+            detail.textContent = zone.detail;
+            source.textContent = 'Sample incident history';
+            popup.append(title, detail, source);
+            L.circle([zone.lat, zone.lng], {
+                color, fillColor: color, fillOpacity: .22, opacity: .85, radius: zone.radius, weight: 2
+            }).bindPopup(popup).addTo(riskLayer);
+        });
+    };
+
+    window.setSignalFilter = function (filter) {
+        const showRisk = filter === 'All Signals';
+        const showCorridors = filter === 'All Signals' || filter === 'Well-Lit Streets';
+        const showPatrol = filter === 'All Signals' || filter === 'Patrol Points';
+        if (showRisk) map.addLayer(riskLayer); else map.removeLayer(riskLayer);
+        if (showCorridors) map.addLayer(corridorLayer); else map.removeLayer(corridorLayer);
+        if (showPatrol) map.addLayer(patrolLayer); else map.removeLayer(patrolLayer);
+    };
+
+    window.setUserLocation = function (latitude, longitude) {
+        if (userMarker) map.removeLayer(userMarker);
+        userMarker = L.circleMarker([latitude, longitude], {
+            radius: 9, color: '#ffffff', fillColor: '#204637', fillOpacity: 1, weight: 4
+        }).bindPopup('<strong>Your current location</strong>');
+        userMarker.addTo(map);
+        map.setView([latitude, longitude], 14);
+    };
+
+    window.clearUserLocation = function () {
+        if (userMarker) map.removeLayer(userMarker);
+        userMarker = null;
+    };
+
+    window.applyNativeState = function (filter, latitude, longitude, zones) {
+        window.setDangerZones(zones);
+        window.setSignalFilter(filter);
+        if (Number.isFinite(latitude) && Number.isFinite(longitude)) {
+            window.setUserLocation(latitude, longitude);
+        } else {
+            window.clearUserLocation();
+        }
+    };
+</script>
+</body>
+</html>

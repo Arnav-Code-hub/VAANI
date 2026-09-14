@@ -1,0 +1,428 @@
+package com.bithead.shelter.ui
+
+import android.annotation.SuppressLint
+import android.content.Intent
+import android.location.Location
+import android.net.Uri
+import android.webkit.WebResourceRequest
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.widget.Toast
+import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.*
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.HelpOutline
+import androidx.compose.material.icons.automirrored.outlined.MenuBook
+import androidx.compose.material.icons.outlined.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import com.bithead.shelter.R
+import com.bithead.shelter.ai.IncidentSummary
+import com.bithead.shelter.data.Evidence
+import com.bithead.shelter.ui.components.EvidenceCard
+import com.bithead.shelter.ui.components.ListeningBars
+import com.bithead.shelter.ui.components.ThreatMeter
+import com.bithead.shelter.ui.theme.*
+import kotlinx.coroutines.delay
+import org.json.JSONArray
+import org.json.JSONObject
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+private val tabs = listOf("Spaces", "Vault", "Community", "Support", "Settings")
+private val tabIcons = listOf(Icons.Outlined.Dashboard, Icons.Outlined.FolderSpecial, Icons.Outlined.NearMe, Icons.AutoMirrored.Outlined.HelpOutline, Icons.Outlined.Tune)
+
+internal data class MapDangerZone(
+    val latitude: Double,
+    val longitude: Double,
+    val radiusMeters: Double,
+    val level: String,
+    val title: String,
+    val detail: String
+)
+
+internal val sampleDangerZones = listOf(
+    MapDangerZone(28.6421, 77.2194, 340.0, "high", "Harassment reports", "8 sample reports in the past 30 days"),
+    MapDangerZone(28.6228, 77.2087, 270.0, "medium", "Poorly lit stretch", "5 sample reports in the past 30 days"),
+    MapDangerZone(28.6356, 77.2315, 230.0, "medium", "Isolated route", "3 sample reports in the past 30 days")
+)
+
+internal fun distanceMeters(lat1: Double, lng1: Double, lat2: Double, lng2: Double): Double {
+    val result = FloatArray(1)
+    Location.distanceBetween(lat1, lng1, lat2, lng2, result)
+    return result[0].toDouble()
+}
+
+private val dangerZonesJson = JSONArray().apply {
+    check(sampleDangerZones.all { it.latitude in -90.0..90.0 && it.longitude in -180.0..180.0 && it.radiusMeters > 0 })
+    sampleDangerZones.forEach { zone ->
+        put(JSONObject()
+            .put("lat", zone.latitude)
+            .put("lng", zone.longitude)
+            .put("radius", zone.radiusMeters)
+            .put("level", zone.level)
+            .put("title", zone.title)
+            .put("detail", zone.detail))
+    }
+}.toString()
+
+@Composable
+fun VaaniApp(
+    isEmergency: Boolean, safeword: String, threatLabel: String, threatScore: Int,
+    lat: Double?, lng: Double?, evidence: List<Evidence>, vaultUnlocked: Boolean,
+    mapLat: Double?, mapLng: Double?,
+    biometricAvailable: Boolean, snackbarHostState: SnackbarHostState,
+    onTrigger: () -> Unit, onEditSafeword: () -> Unit, onPlay: (Evidence) -> Unit,
+    onExport: (Evidence) -> Unit, onVerifyChain: () -> Unit, onUnlockVault: () -> Unit,
+    listening: Boolean, onListeningChange: (Boolean) -> Unit, onLockVault: () -> Unit,
+    onRefreshMapLocation: () -> Unit
+) {
+    var tab by rememberSaveable { mutableIntStateOf(0) }
+    var disguised by rememberSaveable { mutableStateOf(false) }
+    var blackout by remember { mutableStateOf(false) }
+    var message by remember { mutableStateOf<String?>(null) }
+    var decoyDelay by rememberSaveable { mutableIntStateOf(0) }
+    var decoyCall by rememberSaveable { mutableStateOf(false) }
+    LaunchedEffect(decoyDelay) {
+        if (decoyDelay > 0) {
+            delay(decoyDelay * 1000L)
+            decoyDelay = 0
+            decoyCall = true
+        }
+    }
+    val disguise = { onLockVault(); disguised = true }
+    BackHandler(blackout || disguised || tab != 0) {
+        when { blackout -> blackout = false; disguised -> disguised = false; else -> tab = 0 }
+    }
+    if (blackout) {
+        Box(Modifier.fillMaxSize().background(Color.Black)) {
+            TextButton(onClick = { blackout = false }, modifier = Modifier.align(Alignment.BottomCenter).navigationBarsPadding()) {
+                Text("Return to vault", color = Color.Gray)
+            }
+        }
+        return
+    }
+    Scaffold(
+        containerColor = ShelterInk,
+        snackbarHost = { SnackbarHost(snackbarHostState) },
+        topBar = {
+            Row(Modifier.statusBarsPadding().fillMaxWidth().padding(horizontal = 12.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                IconButton(onClick = { if (disguised) disguised = false else disguise() }) {
+                    Icon(if (disguised) Icons.Outlined.FolderOpen else Icons.Outlined.Calculate, if (disguised) "Open safety dashboard" else "Show notes disguise")
+                }
+                Column(Modifier.weight(1f).padding(start = 8.dp)) {
+                    Text(if (disguised) "PERSONAL" else "VAANI", style = MaterialTheme.typography.labelMedium, color = ShelterTextDim)
+                    Text(if (disguised) "All Notes" else listOf("Spaces / Home", "Evidence / Vault", "Community Routes", "Support Network", "Discreet Settings")[tab], style = MaterialTheme.typography.titleLarge)
+                }
+                if (disguised) IconButton(onClick = { disguised = false }) { Icon(Icons.Outlined.Calculate, "Open safety dashboard") }
+                else Image(painterResource(R.drawable.vaani_mark), "SHELTER VAANI", Modifier.size(44.dp).clip(CircleShape))
+            }
+        },
+        bottomBar = {
+            if (!disguised) NavigationBar(containerColor = ShelterInk, tonalElevation = 0.dp) {
+                tabs.forEachIndexed { i, title ->
+                    NavigationBarItem(selected = tab == i, onClick = { tab = i }, icon = { Icon(tabIcons[i], title) },
+                        label = { Text(title, fontSize = 10.sp, maxLines = 1) },
+                        colors = NavigationBarItemDefaults.colors(indicatorColor = ShelterSafeSoft, selectedIconColor = ShelterSafe, selectedTextColor = ShelterSafe))
+                }
+            }
+        }
+    ) { padding ->
+        Box(Modifier.padding(padding)) {
+            if (disguised) NotesScreen()
+            else when (tab) {
+                0 -> Dashboard(isEmergency, safeword, evidence.size, listening, onListeningChange, onEditSafeword, onTrigger,
+                    { tab = it }, disguise, { message = it }, decoyDelay, { decoyDelay = it })
+                1 -> Vault(isEmergency, threatLabel, threatScore, lat, lng, evidence, vaultUnlocked, biometricAvailable,
+                    onTrigger, onUnlockVault, onVerifyChain, onPlay, onExport, { blackout = true })
+                2 -> Community(mapLat, mapLng, onRefreshMapLocation) { message = it }
+                3 -> Support(disguise)
+                4 -> Settings(safeword, listening, onListeningChange, onEditSafeword, disguise, { message = it })
+            }
+        }
+    }
+    message?.let { text ->
+        AlertDialog(onDismissRequest = { message = null }, title = { Text("VAANI") }, text = { Text(text) },
+            confirmButton = { TextButton(onClick = { message = null }) { Text("Got it") } })
+    }
+    if (decoyCall) AlertDialog(onDismissRequest = { decoyCall = false }, icon = { Icon(Icons.Outlined.Phone, null) },
+        title = { Text("Incoming call · Home") }, text = { Text("Simulated call screen. No phone connection or audio.") },
+        confirmButton = { TextButton(onClick = { decoyCall = false }) { Text("End call") } })
+}
+
+@Composable
+private fun Panel(modifier: Modifier = Modifier, color: Color = ShelterSurface, content: @Composable ColumnScope.() -> Unit) {
+    Column(modifier.fillMaxWidth().clip(RoundedCornerShape(20.dp)).background(color).padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp), content = content)
+}
+
+@Composable
+private fun Heading(text: String) { Text(text, style = MaterialTheme.typography.titleMedium) }
+
+@Composable
+private fun Caption(text: String) { Text(text, style = MaterialTheme.typography.bodyMedium, color = ShelterTextDim) }
+
+@Composable
+private fun Badge(text: String) {
+    Text(text, Modifier.clip(RoundedCornerShape(8.dp)).background(ShelterSafeSoft).padding(horizontal = 9.dp, vertical = 5.dp),
+        color = ShelterSafe, style = MaterialTheme.typography.labelMedium)
+}
+
+@Composable
+private fun Action(text: String, icon: ImageVector, onClick: () -> Unit, modifier: Modifier = Modifier, primary: Boolean = true) {
+    Button(onClick = onClick, modifier = modifier.fillMaxWidth().heightIn(min = 52.dp), shape = RoundedCornerShape(12.dp),
+        colors = ButtonDefaults.buttonColors(containerColor = if (primary) ShelterSafe else ShelterSurfaceRaised,
+            contentColor = if (primary) Color.White else MaterialTheme.colorScheme.onSurface)) {
+        Icon(icon, null, Modifier.size(20.dp)); Spacer(Modifier.width(8.dp)); Text(text)
+    }
+}
+
+@Composable
+private fun Dashboard(emergency: Boolean, safeword: String, count: Int, listening: Boolean,
+    onListen: (Boolean) -> Unit, onEdit: () -> Unit, onTrigger: () -> Unit, navigate: (Int) -> Unit,
+    disguise: () -> Unit, info: (String) -> Unit, decoyDelay: Int, scheduleDecoy: (Int) -> Unit) {
+    var confirm by remember { mutableStateOf(false) }
+    LazyColumn(contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
+        item { Panel { Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Outlined.Circle, null, Modifier.size(10.dp), ShelterSafe); Spacer(Modifier.width(10.dp))
+            Column(Modifier.weight(1f)) { Heading(if (emergency) "Recording in progress" else if (listening) "Safeword listening" else "Safeword paused"); Caption("Evidence stays on this device") }
+            Badge("Local")
+        } } }
+        item { Panel(color = ShelterSurfaceRaised) {
+            Row(verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Outlined.Mic, null, tint = ShelterSafe); Spacer(Modifier.width(10.dp)); Text("ACOUSTIC SAFEWORD\nPROTOCOL", Modifier.weight(1f), style = MaterialTheme.typography.labelLarge); Badge(if (listening) "Listen" else "Paused") }
+            Surface(onClick = onEdit, shape = RoundedCornerShape(12.dp), color = Color.White) {
+                Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) { Caption("Trigger phrase"); Heading("“$safeword”") }; Icon(Icons.Outlined.EditNote, "Edit safeword")
+                }
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Outlined.GraphicEq, null); Text("Listen while app is open", Modifier.weight(1f).padding(horizontal = 8.dp), style = MaterialTheme.typography.bodyMedium); Switch(listening, onListen, enabled = !emergency) }
+        } }
+        item { Panel(color = Color(0xFF31312D)) {
+            Icon(Icons.Outlined.VerifiedUser, null, Modifier.align(Alignment.CenterHorizontally).size(40.dp), ShelterSafeSoft)
+            Text(if (emergency) "Your recording is running" else "Your quiet safety shield", Modifier.align(Alignment.CenterHorizontally), style = MaterialTheme.typography.headlineSmall, color = Color.White)
+            Text("Capture audio locally, then seal it with encryption and a tamper-evident record.", color = Color(0xFFC1C8C3), style = MaterialTheme.typography.bodyMedium)
+            Action(if (emergency) "Stop & seal evidence" else "Engage Silent Shield", Icons.Outlined.Shield, { if (emergency) onTrigger() else confirm = true })
+            Text("Local capture • does not dispatch help", color = Color(0xFFC1C8C3), style = MaterialTheme.typography.labelMedium)
+        } }
+        item { Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Panel(Modifier.weight(1f)) { Icon(Icons.Outlined.Contacts, null, tint = ShelterSafe); Heading("Relay Ring"); Caption("Mom, Kabir, Aarti"); Badge("Sample contacts"); Action("View ring", Icons.Outlined.People, { info("Sample relay ring: Mom, Kabir, Aarti. Contact delivery is not connected; no alerts are sent.") }, primary = false) }
+            Panel(Modifier.weight(1f)) { Icon(Icons.Outlined.Lock, null, tint = ShelterSafe); Heading("Secure Vault"); Caption("$count sealed recordings"); Badge("On device"); Action("Open vault", Icons.Outlined.FolderSpecial, { navigate(1) }, primary = false) }
+        } }
+        item { Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Panel(Modifier.weight(1f)) { Icon(Icons.Outlined.Phone, null, tint = ShelterSafe); Heading("Decoy Call"); Caption(if (decoyDelay > 0) "Scheduled in ${decoyDelay}s" else "Simulated incoming screen");
+                Row { TextButton(onClick = { scheduleDecoy(15) }) { Text("15s") }; TextButton(onClick = { scheduleDecoy(30) }) { Text("30s") } } }
+            Panel(Modifier.weight(1f)) { Icon(Icons.Outlined.HealthAndSafety, null, tint = ShelterSafe); Heading("Safe Haven"); Caption("Explore community routes"); Action("Wayfinder", Icons.Outlined.NearMe, { navigate(2) }, primary = false) }
+        } }
+        item { Panel { Heading("Community outposts"); Caption("Preview nearby support locations and route information."); Badge("Sample map • not live"); Action("Explore routes", Icons.Outlined.Map, { navigate(2) }, primary = false) } }
+        item { Action("Switch to notes disguise", Icons.Outlined.VisibilityOff, disguise, primary = false) }
+    }
+    if (confirm) AlertDialog(onDismissRequest = { confirm = false }, title = { Text("Start local recording?") }, text = { Text("Audio is recorded on this device. Stop and seal it in the vault. No emergency services or contacts will be notified.") },
+        confirmButton = { TextButton(onClick = { confirm = false; onTrigger() }) { Text("Start recording") } }, dismissButton = { TextButton(onClick = { confirm = false }) { Text("Cancel") } })
+}
+
+@Composable
+private fun Vault(emergency: Boolean, label: String, score: Int, lat: Double?, lng: Double?, evidence: List<Evidence>, unlocked: Boolean,
+    biometric: Boolean, trigger: () -> Unit, unlock: () -> Unit, verify: () -> Unit, play: (Evidence) -> Unit,
+    export: (Evidence) -> Unit, blackout: () -> Unit) {
+    val dateFormat = remember { SimpleDateFormat("dd MMM, HH:mm", Locale.getDefault()) }
+    var audioTab by rememberSaveable { mutableIntStateOf(0) }
+    LazyColumn(contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
+        item { Panel { Row(verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Outlined.Lock, null, tint = ShelterSafe); Spacer(Modifier.width(12.dp)); Column(Modifier.weight(1f)) { Heading("Stealth Evidence Vault"); Caption("On-device • AES-256-GCM") }; Badge(if (unlocked) "Unlocked" else "Locked") } } }
+        item { Panel(color = ShelterSurfaceRaised) {
+            Heading(if (emergency) "MIC RECORDING" else "LOCAL CAPTURE")
+            ListeningBars(emergency, ShelterSafe, Modifier.align(Alignment.CenterHorizontally).height(40.dp))
+            Text(if (emergency) "Recording…" else "Ready when you are", Modifier.align(Alignment.CenterHorizontally), style = MaterialTheme.typography.headlineSmall)
+            Caption(if (emergency) "Auto-seals after 5 minutes" else "Start recording from Spaces")
+            TabRow(selectedTabIndex = audioTab, containerColor = ShelterSurfaceRaised) {
+                listOf("Audio", "Location").forEachIndexed { i, title -> Tab(audioTab == i, onClick = { audioTab = i }, text = { Text(title) }) }
+            }
+            if (audioTab == 0) ThreatMeter(label, score) else Caption(if (lat != null && lng != null) "Last sealed location: $lat, $lng" else "A location fix is requested when evidence is sealed.")
+        } }
+        item { Action("Blackout display", Icons.Outlined.VisibilityOff, blackout, primary = false) }
+        if (emergency) item { Action("Stop & seal vault", Icons.Outlined.Lock, trigger) }
+        item { Panel { Heading("Offline first storage"); Caption("Sealed recordings stay on this device. Unlock to play or export a chain-of-custody record. No cloud or peer sync is connected.") } }
+        item { Heading("ENCRYPTED EVIDENCE LOG") }
+        if (!unlocked) item { Panel(color = Color.White) {
+            Icon(Icons.Outlined.Fingerprint, null, Modifier.size(36.dp), ShelterSafe)
+            Heading("Your evidence is private")
+            Caption(if (biometric) "Authenticate to view sealed recordings." else "Set up a device screen lock or biometrics to access the vault.")
+            Button(onClick = unlock, enabled = biometric, modifier = Modifier.fillMaxWidth()) { Text("Unlock vault") }
+        } } else {
+            item { Action("Verify chain integrity", Icons.Outlined.VerifiedUser, verify) }
+            if (evidence.isEmpty()) item { Panel { Heading("No sealed recordings yet"); Caption("Record from Spaces, then stop and seal to create your first entry.") } }
+            items(evidence, key = { it.id }) { entry -> EvidenceCard(entry.id, dateFormat.format(Date(entry.createdAt)), entry.threatLabel, entry.threatScore, entry.latitude, entry.longitude, entry.sha256, entry.previousHash, IncidentSummary.describe(entry), { play(entry) }, { export(entry) }) }
+        }
+    }
+}
+
+@Composable
+private fun NotesScreen() {
+    val context = LocalContext.current
+    val prefs = remember { context.getSharedPreferences("vaani_notes", 0) }
+    var query by rememberSaveable { mutableStateOf("") }
+    var category by rememberSaveable { mutableStateOf("All Notes") }
+    var note by rememberSaveable { mutableStateOf(prefs.getString("memo", "") ?: "") }
+    var editor by remember { mutableStateOf(false) }
+    val groceries = listOf("Cold-pressed olive oil & balsamic vinegar", "Organic unsweetened almond milk", "Artisan sourdough boule (sliced)", "Fresh mint leaves & baby spinach", "Loose leaf chamomile tea")
+    val checked = remember { mutableStateListOf(*Array(5) { prefs.getBoolean("grocery_$it", it < 2) }) }
+    fun matches(title: String, group: String) = (category == "All Notes" || category == group) && title.contains(query, true)
+    LazyColumn(contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        item { OutlinedTextField(query, { query = it }, Modifier.fillMaxWidth(), placeholder = { Text("Search memos, recipes, lists…") }, leadingIcon = { Icon(Icons.Outlined.Search, null) }, shape = RoundedCornerShape(16.dp), singleLine = true) }
+        item { Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) { listOf("All Notes", "Groceries", "Reading", "Work Sync").forEach { label -> FilterChip(category == label, { category = label }, label = { Text(label) }) } } }
+        if (matches("Weekly Grocery & Market", "Groceries")) item { Panel {
+            Heading("Weekly Grocery & Market"); Caption("Items for Saturday brunch prep & weekly staples from the corner market.")
+            groceries.forEachIndexed { i, text -> Row(verticalAlignment = Alignment.CenterVertically) { Checkbox(checked[i], { checked[i] = it; prefs.edit().putBoolean("grocery_$i", it).apply() }); Text(text, style = MaterialTheme.typography.bodyMedium, textDecoration = if (checked[i]) TextDecoration.LineThrough else null) } }
+            Caption("${checked.count { it }} of 5 done  •  Groceries")
+        } }
+        if (matches("Reading Journal", "Reading")) item { Panel { Icon(Icons.AutoMirrored.Outlined.MenuBook, null, Modifier.size(32.dp), ShelterSafe); Heading("Reading Journal"); Caption("‘In Praise of Shadows’ & essays on quiet architecture, domestic rituals…"); Badge("Personal • 3 recommendations") } }
+        if (matches("Tuesday Sync: Platform Review", "Work Sync")) item { Panel { Heading("Tuesday Sync: Platform Review"); Caption("Action items from product design alignment and quarterly review:"); Text("• Standardize typography across the app.\n\n• Review the memo input experience.\n\n• Finalize this week's deliverables."); Caption("Updated by Sarah • Work Sync") } }
+        if (matches("Roasted Butternut Soup", "Groceries")) item { Panel { Heading("Roasted Butternut Soup"); Caption("Caramelize with nutmeg, brown butter, shallots, and crisp sage…"); Badge("Kitchen • 45 mins") } }
+        if (note.isNotBlank() && matches(note, "All Notes")) item { Panel { Heading("My memo"); Text(note); TextButton(onClick = { editor = true }) { Text("Edit memo") } } }
+        item { Action("Write a memo", Icons.Outlined.EditNote, { editor = true }) }
+    }
+    if (editor) AlertDialog(onDismissRequest = { editor = false }, title = { Text("My memo") }, text = { OutlinedTextField(note, { note = it }, minLines = 4, label = { Text("Note") }) },
+        confirmButton = { TextButton(onClick = { prefs.edit().putString("memo", note).apply(); editor = false }) { Text("Save") } })
+}
+
+private fun nearbyDangerZone(latitude: Double?, longitude: Double?): MapDangerZone? {
+    if (latitude == null || longitude == null) return null
+    return sampleDangerZones
+        .minByOrNull { distanceMeters(latitude, longitude, it.latitude, it.longitude) }
+        ?.takeIf { distanceMeters(latitude, longitude, it.latitude, it.longitude) <= it.radiusMeters }
+}
+
+@SuppressLint("SetJavaScriptEnabled")
+@Composable
+private fun LeafletMap(filter: String, latitude: Double?, longitude: Double?, modifier: Modifier = Modifier) {
+    val context = LocalContext.current
+    val webView = remember(context) {
+        WebView(context).apply {
+            setBackgroundColor(android.graphics.Color.TRANSPARENT)
+            settings.javaScriptEnabled = true
+            settings.allowFileAccess = true
+            settings.allowContentAccess = false
+            settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
+            settings.builtInZoomControls = false
+            settings.displayZoomControls = false
+            webViewClient = object : WebViewClient() {
+                override fun onPageFinished(view: WebView, url: String) {
+                    (view.tag as? String)?.let { view.evaluateJavascript(it, null) }
+                }
+
+                override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean = true
+            }
+            loadUrl("file:///android_asset/leaflet_map.html")
+        }
+    }
+    val validLocation = latitude?.isFinite() == true && longitude?.isFinite() == true
+    val script = remember(filter, latitude, longitude) {
+        val lat = if (validLocation) latitude.toString() else "null"
+        val lng = if (validLocation) longitude.toString() else "null"
+        "window.applyNativeState && window.applyNativeState(${JSONObject.quote(filter)}, $lat, $lng, $dangerZonesJson);"
+    }
+    DisposableEffect(webView) {
+        onDispose {
+            webView.stopLoading()
+            webView.destroy()
+        }
+    }
+    AndroidView(
+        factory = { webView },
+        update = { view ->
+            if (view.tag != script) {
+                view.tag = script
+                view.evaluateJavascript(script, null)
+            }
+        },
+        modifier = modifier
+    )
+}
+
+@Composable
+private fun Community(latitude: Double?, longitude: Double?, refreshLocation: () -> Unit, info: (String) -> Unit) {
+    var filter by rememberSaveable { mutableStateOf("All Signals") }
+    var factor by rememberSaveable { mutableStateOf("Dark stretch") }
+    var reports by rememberSaveable { mutableIntStateOf(0) }
+    val context = LocalContext.current
+    val nearbyZone = remember(latitude, longitude) { nearbyDangerZone(latitude, longitude) }
+    LaunchedEffect(Unit) { refreshLocation() }
+    LaunchedEffect(nearbyZone?.title) {
+        nearbyZone?.let { info("Caution: you are inside the sample ${it.title.lowercase()} zone. Check local conditions and choose a well-lit route.") }
+    }
+    LazyColumn(contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
+        item { Row(verticalAlignment = Alignment.CenterVertically) { Badge("Leaflet • sample incident history"); Spacer(Modifier.weight(1f)); TextButton(onClick = refreshLocation) { Text("Refresh location") } } }
+        if (nearbyZone != null) item { Panel(color = Color(0xFFFFDAD6)) { Heading("Caution near ${nearbyZone.title.lowercase()}"); Caption("Your current location overlaps this sample risk area. Use the map to check a well-lit alternative.") } }
+        item { LeafletMap(filter, latitude, longitude, Modifier.fillMaxWidth().height(330.dp).clip(RoundedCornerShape(20.dp))) }
+        item { Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) { listOf("All Signals", "Well-Lit Streets", "Patrol Points").forEach { label -> FilterChip(filter == label, { filter = label }, label = { Text(label) }) } } }
+        item { Panel { Heading("Safe Corridor Preview"); Badge("Sample data"); Panel(color = Color.White) { Heading("Suggested: Metro Boulevard"); Caption("Leaflet route overlay • no live safety score"); Action("Open device maps", Icons.Outlined.NearMe, { openLink(context, "geo:0,0?q=nearby+police+station") }) }; Caption("Map tiles require internet access. Route availability and local conditions must still be checked.") } }
+        item { Heading("COMMUNITY OBSERVATIONS") }
+        item { Panel { Heading("Night transit shuttle"); Caption("Sample • Gate 4 station, regular service"); HorizontalDivider(); Heading("Street lamp repaired"); Caption("Sample • Neighborhood maintenance update") } }
+        item { Panel {
+            Heading("Report environmental factor"); Caption("Try a local demo report. Nothing is published or sent.")
+            listOf("Dark stretch", "Isolated alley", "Harassment hotspot", "Stray dogs").chunked(2).forEach { row -> Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { row.forEach { text -> FilterChip(factor == text, { factor = text }, label = { Text(text, fontSize = 12.sp) }) } } }
+            Action("Save demo signal", Icons.Outlined.AddLocationAlt, { reports++; info("Demo signal saved for this session: $factor. It has not been shared.") })
+            Caption("$reports local demo signals this session")
+        } }
+        item { Panel { Heading("Find a nearby support point"); Caption("Search your map app for a hospital or police station."); Action("Find hospitals", Icons.Outlined.LocalHospital, { openLink(context, "geo:0,0?q=nearby+hospital") }, primary = false) } }
+    }
+}
+
+private fun openLink(context: android.content.Context, uri: String) {
+    try { context.startActivity(Intent(if (uri.startsWith("tel:")) Intent.ACTION_DIAL else Intent.ACTION_VIEW, Uri.parse(uri))) }
+    catch (_: android.content.ActivityNotFoundException) { Toast.makeText(context, "No app available to open this action", Toast.LENGTH_SHORT).show() }
+}
+
+@Composable
+private fun Support(disguise: () -> Unit) {
+    val context = LocalContext.current
+    var expanded by rememberSaveable { mutableStateOf("") }
+    LazyColumn(contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
+        item { Panel { Badge("SAFE SANCTUARY • VAANI CARE"); Heading("You deserve support."); Caption("Choose a public support resource. Calls open your dialer so you remain in control.") } }
+        item { Heading("EMERGENCY & SUPPORT • INDIA") }
+        item { Panel(color = Color.White) { Icon(Icons.Outlined.HealthAndSafety, null, tint = ShelterSafe); Heading("Emergency assistance"); Caption("India's emergency response number for police, fire and medical emergencies."); Action("Dial 112", Icons.Outlined.Phone, { openLink(context, "tel:112") }); TextButton(onClick = { openLink(context, "https://112.gov.in/") }) { Text("Official service information") } } }
+        item { Panel { Heading("Legal Aid & Assistance"); Caption("National Legal Services Authority (NALSA)"); Badge("Public helpline"); Action("Dial 15100", Icons.Outlined.Gavel, { openLink(context, "tel:15100") }, primary = false); TextButton(onClick = { openLink(context, "https://nalsa.gov.in/womens-assistance/") }) { Text("Legal assistance resources") } } }
+        item { Panel { Heading("Cyber Safety & Harassment"); Caption("Use the National Cyber Crime Reporting Portal to report cybercrime. 1930 is the financial cyber fraud helpline."); Action("Open reporting portal", Icons.Outlined.Security, { openLink(context, "https://cybercrime.gov.in/") }, primary = false); TextButton(onClick = { openLink(context, "tel:1930") }) { Text("Dial 1930 • financial fraud") } } }
+        item { Heading("SUPPORT GUIDES") }
+        listOf("Finding legal assistance" to "Explore NALSA's official assistance page for available services and eligibility.", "Digital privacy" to "Review app permissions and linked devices in your device settings. The official cybercrime portal provides reporting resources.", "Finding local care" to "Use device maps to search for nearby hospitals. In an emergency in India, open the dialer for 112.").forEach { (title, text) ->
+            item { Panel(color = Color.White) { TextButton(onClick = { expanded = if (expanded == title) "" else title }) { Text(title, Modifier.weight(1f)); Icon(if (expanded == title) Icons.Outlined.ExpandLess else Icons.Outlined.ExpandMore, null) }; if (expanded == title) Caption(text) } }
+        }
+        item { Action("Quick exit to notes", Icons.Outlined.VisibilityOff, disguise, primary = false) }
+    }
+}
+
+@Composable
+private fun Settings(safeword: String, listening: Boolean, onListen: (Boolean) -> Unit, edit: () -> Unit, disguise: () -> Unit, info: (String) -> Unit) {
+    val context = LocalContext.current
+    LazyColumn(contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
+        item { Panel { Heading("Protection preferences"); Caption("Local capture • notes disguise"); Badge(if (listening) "Listening" else "Paused") } }
+        item { Heading("ACOUSTIC TRIGGER") }
+        item { Panel(color = Color.White) { Caption("Current safeword phrase"); Heading("“$safeword”"); Action("Edit safeword", Icons.Outlined.Edit, edit, primary = false); Caption("Listens while the app is open. Offline recognition depends on your device."); Row(verticalAlignment = Alignment.CenterVertically) { Text("Safeword listening", Modifier.weight(1f)); Switch(listening, onListen) } } }
+        item { Heading("DEVICE & VAULT SECURITY") }
+        item { Panel { Heading("Biometric vault lock"); Caption("Uses your device fingerprint, face, or screen lock. The vault locks when the app leaves the foreground."); Action("Device security settings", Icons.Outlined.Fingerprint, { context.startActivity(Intent(android.provider.Settings.ACTION_SECURITY_SETTINGS)) }, primary = false) } }
+        item { Panel { Heading("Hardware & background triggers"); Caption("Power-button triggers, face-down detection, Bluetooth relay, and background monitoring are not connected in this prototype."); Badge("Preview only"); Action("View planned triggers", Icons.Outlined.Sensors, { info("Planned: hardware gestures, low-battery save, nighttime checks and Bluetooth relay. These features are not active and cannot dispatch help.") }, primary = false) } }
+        item { Heading("DECOY APP PERSONA") }
+        item { Panel(color = Color.White) { Heading("Daily Notes"); Caption("A working notes screen with a grocery checklist and your own memo. Tap the calculator icon to return to VAANI."); Action("Open notes disguise", Icons.Outlined.EditNote, disguise); Caption("Changes the screen inside VAANI; the launcher name and icon stay unchanged.") } }
+        item { Heading("LANGUAGE & DISPATCH") }
+        item { Panel { Heading("English interface"); Caption("Speech recognition uses your device language. Translated screens and SMS dispatch are not connected.") } }
+        item { Action("Test interface quietly", Icons.Outlined.CheckCircleOutline, { info("Interface check complete. No recording was started and no contacts were notified. To test real recording, use Engage Silent Shield on Spaces.") }) }
+    }
+}
