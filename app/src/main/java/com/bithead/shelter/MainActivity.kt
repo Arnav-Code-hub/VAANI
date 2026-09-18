@@ -204,6 +204,7 @@ class MainActivity : FragmentActivity() {
                     onPlaybackStop = { stopEvidencePlayback() },
                     onPlaybackSeek = { evidence, position -> seekEvidencePlayback(evidence, position) },
                     onExport = { exportChainOfCustody(it) },
+                    onDeleteEvidence = { deleteEvidence(it) },
                     onVerifyChain = { verifyEvidenceChain() },
                     onUnlockVault = { unlockVault() },
                     listening = listeningEnabled,
@@ -991,29 +992,92 @@ class MainActivity : FragmentActivity() {
 
     private fun verifyEvidenceChain() {
         lifecycleScope.launch {
-            val entries = db.evidenceDao().allAscending()
-            if (entries.isEmpty()) {
-                snackbarHostState.showSnackbar("No evidence to verify yet")
-                return@launch
-            }
-            var previousChain: String? = null
-            var brokenAt: Long? = null
-            for (item in entries) {
-                val file = File(filesDir, item.encryptedFile)
-                if (!file.exists()) { brokenAt = item.id; break }
-                val currentFileHash = Crypto.sha256(file)
-                val expectedChain = Crypto.chainHash(currentFileHash, previousChain)
-                if (expectedChain != item.sha256 || previousChain != item.previousHash) {
-                    brokenAt = item.id
-                    break
+            val message = try {
+                withContext(Dispatchers.IO) {
+                    sealMutex.withLock {
+                        val entries = db.evidenceDao().allAscending()
+                        if (entries.isEmpty()) return@withLock "No evidence to verify yet"
+                        var previousChain: String? = null
+                        for (item in entries) {
+                            val file = File(filesDir, item.encryptedFile)
+                            val storedHash = item.deletedFileHash
+                            val fileHash = when {
+                                storedHash != null -> {
+                                    if (file.exists() && Crypto.sha256(file) != storedHash) {
+                                        return@withLock "⚠ Tamper detected: evidence #${item.id} does not match its deletion record"
+                                    }
+                                    if (item.deletedAt != null && file.exists()) {
+                                        return@withLock "⚠ Deletion incomplete for evidence #${item.id}"
+                                    }
+                                    storedHash
+                                }
+                                file.exists() -> Crypto.sha256(file)
+                                else -> return@withLock "⚠ Tamper detected: evidence #${item.id} is missing"
+                            }
+                            if (Crypto.chainHash(fileHash, previousChain) != item.sha256 || previousChain != item.previousHash) {
+                                return@withLock "⚠ Tamper detected: evidence #${item.id} does not match its recorded hash chain"
+                            }
+                            previousChain = item.sha256
+                        }
+                        val deleted = entries.count { it.deletedAt != null }
+                        val pending = entries.count { it.deletedFileHash != null && it.deletedAt == null }
+                        when {
+                            pending > 0 -> "Chain links verified; $pending audio deletion${if (pending == 1) "" else "s"} still pending"
+                            deleted > 0 -> "Chain verified ✓ — ${entries.size - deleted} recordings intact; $deleted deletion record${if (deleted == 1) "" else "s"} retained"
+                            else -> "Chain verified ✓ — all ${entries.size} recordings intact"
+                        }
+                    }
                 }
-                previousChain = item.sha256
+            } catch (e: Exception) {
+                "Chain verification failed: ${e.message ?: "storage error"}"
             }
-            if (brokenAt == null) {
-                snackbarHostState.showSnackbar("Chain verified ✓ — all ${entries.size} entries intact, no tampering detected")
-            } else {
-                snackbarHostState.showSnackbar("⚠ Tamper detected: evidence #$brokenAt does not match its recorded hash chain")
+            snackbarHostState.showSnackbar(message)
+        }
+    }
+
+    private fun deleteEvidence(evidence: Evidence) {
+        if (!vaultUnlocked) return
+        if (playbackState.evidenceId == evidence.id) stopEvidencePlayback()
+        lifecycleScope.launch {
+            try {
+                withContext(NonCancellable + Dispatchers.IO) {
+                    sealMutex.withLock {
+                        val dao = db.evidenceDao()
+                        val current = dao.byId(evidence.id) ?: throw IOException("Recording no longer exists")
+                        if (current.deletedAt != null) return@withLock
+                        val encrypted = File(filesDir, current.encryptedFile)
+                        val fileHash = current.deletedFileHash ?: run {
+                            if (!encrypted.exists()) throw IOException("Encrypted recording is missing; verify the chain")
+                            Crypto.sha256(encrypted)
+                        }
+                        if (Crypto.chainHash(fileHash, current.previousHash) != current.sha256) {
+                            throw IOException("Recording hash does not match the vault chain")
+                        }
+                        if (current.deletedFileHash == null && dao.requestDeletion(current.id, fileHash) != 1) {
+                            throw IOException("Could not save the deletion record")
+                        }
+                        completePendingDeletion(current.copy(deletedFileHash = fileHash))
+                    }
+                }
+                snackbarHostState.showSnackbar("Recording deleted; its hash-chain deletion record remains")
+            } catch (e: Exception) {
+                snackbarHostState.showSnackbar("Delete incomplete: ${e.message ?: "storage error"}. Tap Delete to retry")
             }
+        }
+    }
+
+    private suspend fun completePendingDeletion(entry: Evidence) {
+        val hash = entry.deletedFileHash ?: throw IOException("Deletion record is missing its file hash")
+        val encrypted = File(filesDir, entry.encryptedFile)
+        if (encrypted.exists() && Crypto.sha256(encrypted) != hash) {
+            throw IOException("Encrypted recording changed after deletion was requested")
+        }
+        pendingRawFor(entry.encryptedFile)?.let { raw ->
+            if (raw.exists() && !raw.delete()) throw IOException("Could not remove the pending raw recording")
+        }
+        if (encrypted.exists() && !encrypted.delete()) throw IOException("Could not remove the encrypted recording")
+        if (db.evidenceDao().finishDeletion(entry.id, System.currentTimeMillis()) != 1) {
+            throw IOException("Could not finish the deletion record")
         }
     }
 
@@ -1023,13 +1087,26 @@ class MainActivity : FragmentActivity() {
                 if (startupRecoveryComplete) return@withLock null
                 try {
                     val dao = db.evidenceDao()
-                    val knownFiles = dao.allEncryptedFileNames().toHashSet()
+                    val entries = dao.allAscending()
+                    val knownFiles = entries.mapTo(HashSet()) { it.encryptedFile }
+                    var failure: String? = null
+
+                    // A crash can interrupt deletion after the hash-only marker
+                    // commits. Finish removing those files before scanning orphans.
+                    for (entry in entries.filter { it.deletedFileHash != null && it.deletedAt == null }) {
+                        try {
+                            completePendingDeletion(entry)
+                        } catch (e: Exception) {
+                            failure = "Deletion #${entry.id}: ${e.message ?: "storage error"}"
+                            break
+                        }
+                    }
 
                     // A crash after the Room commit but before plaintext cleanup
                     // can leave the matching pending raw file behind. A present
                     // encrypted file plus its DB row proves that cleanup is safe.
-                    knownFiles.forEach { fileName ->
-                        if (File(filesDir, fileName).exists()) pendingRawFor(fileName)?.delete()
+                    entries.filter { it.deletedFileHash == null }.forEach { entry ->
+                        if (File(filesDir, entry.encryptedFile).exists()) pendingRawFor(entry.encryptedFile)?.delete()
                     }
 
                     val orphanedFiles = filesDir.listFiles()
@@ -1044,7 +1121,6 @@ class MainActivity : FragmentActivity() {
                             { it.name }
                         ))
                     var recovered = 0
-                    var failure: String? = null
 
                     for (file in orphanedFiles) {
                         try {
@@ -1069,7 +1145,7 @@ class MainActivity : FragmentActivity() {
                         } catch (e: Exception) {
                             // Preserve this and all later files. Appending a newer
                             // orphan first would reverse their capture order.
-                            failure = e.message ?: "storage error"
+                            if (failure == null) failure = e.message ?: "storage error"
                             break
                         }
                     }
@@ -1088,7 +1164,7 @@ class MainActivity : FragmentActivity() {
             )
         }
         result.failure?.let {
-            snackbarHostState.showSnackbar("Evidence recovery paused: $it. Files were preserved.")
+            snackbarHostState.showSnackbar("Evidence recovery needs attention: $it")
         }
     }
 

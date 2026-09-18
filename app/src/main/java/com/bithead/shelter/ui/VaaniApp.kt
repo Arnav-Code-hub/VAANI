@@ -4,7 +4,13 @@ import android.annotation.SuppressLint
 import android.content.Intent
 import android.location.Location
 import android.net.Uri
+import android.util.Log
+import android.webkit.ConsoleMessage
+import android.webkit.JavascriptInterface
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -49,6 +55,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayInputStream
+import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -126,7 +134,8 @@ fun VaaniApp(
     onTrigger: () -> Unit, onEditSafeword: () -> Unit,
     playbackState: EvidencePlaybackState, onPlaybackToggle: (Evidence) -> Unit,
     onPlaybackStop: () -> Unit, onPlaybackSeek: (Evidence, Long) -> Unit,
-    onExport: (Evidence) -> Unit, onVerifyChain: () -> Unit, onUnlockVault: () -> Unit,
+    onExport: (Evidence) -> Unit, onDeleteEvidence: (Evidence) -> Unit,
+    onVerifyChain: () -> Unit, onUnlockVault: () -> Unit,
     listening: Boolean, listeningActive: Boolean, onListeningChange: (Boolean) -> Unit,
     gestureWakeMode: Boolean, gestureWindowOpening: Boolean, gestureWindowSecondsRemaining: Int,
     onGestureWakeModeChange: (Boolean) -> Unit, onLockVault: () -> Unit, onVaultHidden: () -> Unit,
@@ -207,7 +216,7 @@ fun VaaniApp(
                     { tab = it }, disguise, { message = it }, decoyDelay, { decoyDelay = it })
                 1 -> Vault(isEmergency, isSealing, threatLabel, threatScore, lat, lng, evidence, vaultUnlocked, biometricAvailable,
                     onTrigger, onUnlockVault, onVerifyChain, playbackState, onPlaybackToggle, onPlaybackStop,
-                    onPlaybackSeek, onExport, { blackout = true })
+                    onPlaybackSeek, onExport, onDeleteEvidence, { blackout = true })
                 2 -> Community(mapLat, mapLng, mapAccuracyMeters, mapLocationTimestamp, onRefreshMapLocation) { message = it }
                 3 -> Support(disguise)
                 4 -> Settings(safeword, listening, onListeningChange, gestureWakeMode, onGestureWakeModeChange, onEditSafeword, disguiseEnabled, onDisguiseEnabledChange, disguise, { message = it })
@@ -306,9 +315,11 @@ private fun Dashboard(emergency: Boolean, isSealing: Boolean, safeword: String, 
 private fun Vault(emergency: Boolean, isSealing: Boolean, label: String, score: Int, lat: Double?, lng: Double?, evidence: List<Evidence>, unlocked: Boolean,
     biometric: Boolean, trigger: () -> Unit, unlock: () -> Unit, verify: () -> Unit,
     playback: EvidencePlaybackState, togglePlayback: (Evidence) -> Unit, stopPlayback: () -> Unit,
-    seekPlayback: (Evidence, Long) -> Unit, export: (Evidence) -> Unit, blackout: () -> Unit) {
+    seekPlayback: (Evidence, Long) -> Unit, export: (Evidence) -> Unit,
+    deleteEvidence: (Evidence) -> Unit, blackout: () -> Unit) {
     val dateFormat = remember { SimpleDateFormat("dd MMM, HH:mm", Locale.getDefault()) }
     var audioTab by rememberSaveable { mutableIntStateOf(0) }
+    var pendingDeletion by remember { mutableStateOf<Evidence?>(null) }
     LazyColumn(contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
         item { Panel { Row(verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Outlined.Lock, null, tint = ShelterSafe); Spacer(Modifier.width(12.dp)); Column(Modifier.weight(1f)) { Heading("Stealth Evidence Vault"); Caption("On-device • AES-256-GCM") }; Badge(if (unlocked) "Unlocked" else "Locked") } } }
         item { Panel(color = ShelterSurfaceRaised) {
@@ -349,10 +360,25 @@ private fun Vault(emergency: Boolean, isSealing: Boolean, label: String, score: 
                     onPlayPause = { togglePlayback(entry) },
                     onStop = stopPlayback,
                     onSeek = { seekPlayback(entry, it) },
-                    onExport = { export(entry) }
+                    onExport = { export(entry) },
+                    deletionPending = entry.deletedFileHash != null,
+                    onDelete = { pendingDeletion = entry }
                 )
             }
         }
+    }
+    pendingDeletion?.let { entry ->
+        AlertDialog(
+            onDismissRequest = { pendingDeletion = null },
+            title = { Text(if (entry.deletedFileHash == null) "Delete recording?" else "Retry deletion?") },
+            text = { Text("The audio will be permanently removed from this device. Its hash-only deletion record stays in the chain, so later recordings can still be verified.") },
+            confirmButton = {
+                TextButton(onClick = { pendingDeletion = null; deleteEvidence(entry) }) {
+                    Text("Delete permanently", color = ShelterDanger)
+                }
+            },
+            dismissButton = { TextButton(onClick = { pendingDeletion = null }) { Text("Cancel") } }
+        )
     }
 }
 
@@ -410,26 +436,103 @@ private fun LeafletMap(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
-    val webView = remember(context) {
+    var mapError by remember { mutableStateOf<String?>(null) }
+    var mapReady by remember { mutableStateOf(false) }
+    var mapLoadAttempt by remember { mutableIntStateOf(0) }
+    LaunchedEffect(mapLoadAttempt) {
+        delay(8_000L)
+        if (!mapReady && mapError == null) mapError = "Map did not finish loading. Tap Retry to reload it."
+    }
+    val checkMapSize: (WebView) -> Unit = { view ->
+        if (view.width > 0 && view.height > 0) {
+            view.evaluateJavascript(
+                "window.invalidateMapSize && window.invalidateMapSize(); Boolean(window.isMapReady && window.isMapReady());"
+            ) { result ->
+                if (result == "true" || result == "\"true\"") {
+                    mapReady = true
+                    mapError = null
+                }
+            }
+        }
+    }
+    val webView = remember(context, mapLoadAttempt) {
         WebView(context).apply {
             setBackgroundColor(android.graphics.Color.TRANSPARENT)
             settings.javaScriptEnabled = true
-            settings.allowFileAccess = true
+            settings.allowFileAccess = false
             settings.allowContentAccess = false
+            settings.domStorageEnabled = true
             settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
             settings.builtInZoomControls = false
             settings.displayZoomControls = false
+            settings.userAgentString = "${settings.userAgentString} VAANI-Android/1.0"
+            addJavascriptInterface(object {
+                @JavascriptInterface
+                fun onMapReady() {
+                    (context as? android.app.Activity)?.runOnUiThread {
+                        mapReady = true
+                        mapError = null
+                    } ?: run {
+                        mapReady = true
+                        mapError = null
+                    }
+                }
+            }, "AndroidBridge")
+            webChromeClient = object : WebChromeClient() {
+                override fun onConsoleMessage(message: ConsoleMessage): Boolean {
+                    if (message.messageLevel() == ConsoleMessage.MessageLevel.ERROR) {
+                        Log.e("VaaniMap", "${message.message()} (${message.sourceId()}:${message.lineNumber()})")
+                    }
+                    return true
+                }
+            }
             webViewClient = object : WebViewClient() {
+                override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
+                    if (request.url.scheme != "https" || request.url.host != "appassets.androidplatform.net") return null
+                    val path = request.url.path.orEmpty()
+                    val asset = path.removePrefix("/assets/")
+                    if (!path.startsWith("/assets/") || asset.contains("..") ||
+                        (asset != "leaflet_map.html" && !asset.startsWith("leaflet/"))) {
+                        return WebResourceResponse("text/plain", "UTF-8", 404, "Not Found", emptyMap(), ByteArrayInputStream(byteArrayOf()))
+                    }
+                    val mime = when {
+                        asset.endsWith(".html") -> "text/html"
+                        asset.endsWith(".css") -> "text/css"
+                        asset.endsWith(".js") -> "text/javascript"
+                        asset.endsWith(".png") -> "image/png"
+                        else -> "text/plain"
+                    }
+                    return try {
+                        WebResourceResponse(mime, if (mime.startsWith("text/")) "UTF-8" else null, context.assets.open(asset))
+                    } catch (_: IOException) {
+                        WebResourceResponse("text/plain", "UTF-8", 404, "Not Found", emptyMap(), ByteArrayInputStream(byteArrayOf()))
+                    }
+                }
+
                 override fun onPageFinished(view: WebView, url: String) {
                     (view.tag as? String)?.let { view.evaluateJavascript(it, null) }
-                    view.post {
-                        view.evaluateJavascript("window.invalidateMapSize && window.invalidateMapSize();", null)
+                    view.post { checkMapSize(view) }
+                    view.postDelayed({ checkMapSize(view) }, 500L)
+                    view.postDelayed({ checkMapSize(view) }, 1500L)
+                }
+
+                override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
+                    if (request.isForMainFrame) {
+                        mapReady = false
+                        mapError = "Map page could not load. Tap Retry to try again."
                     }
                 }
 
                 override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean = true
             }
-            loadUrl("file:///android_asset/leaflet_map.html")
+            addOnLayoutChangeListener { view, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom ->
+                if (right > left && bottom > top) {
+                    if (right - left != oldRight - oldLeft || bottom - top != oldBottom - oldTop) {
+                        view.post { checkMapSize(view as WebView) }
+                    }
+                }
+            }
+            loadUrl("https://appassets.androidplatform.net/assets/leaflet_map.html")
         }
     }
     val validLocation = latitude?.isFinite() == true && longitude?.isFinite() == true
@@ -449,30 +552,42 @@ private fun LeafletMap(
     DisposableEffect(webView) {
         onDispose {
             webView.stopLoading()
-            webView.destroy()
         }
     }
-    AndroidView(
-        factory = { webView },
-        update = { view ->
-            if (view.tag != script) {
-                view.tag = script
-                view.evaluateJavascript(script, null)
-            }
-            // Compose can attach the WebView before its final measured size is
-            // available. Posting invalidation lets Leaflet recalculate after
-            // AndroidView has real bounds, including when returning to this tab.
-            view.post {
-                view.evaluateJavascript("window.invalidateMapSize && window.invalidateMapSize();", null)
-            }
-            view.postDelayed({
-                if (view.isAttachedToWindow) {
-                    view.evaluateJavascript("window.invalidateMapSize && window.invalidateMapSize();", null)
+    Box(modifier) {
+        AndroidView(
+            factory = { webView },
+            update = { view ->
+                if (view.tag != script) {
+                    view.tag = script
+                    view.evaluateJavascript(script, null)
                 }
-            }, 150L)
-        },
-        modifier = modifier
-    )
+                view.post { checkMapSize(view) }
+            },
+            modifier = Modifier.fillMaxSize()
+        )
+        if (!mapReady) {
+            Column(
+                Modifier.fillMaxSize().background(Color(0xFFE4EBDF)).padding(20.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center
+            ) {
+                if (mapError == null) {
+                    CircularProgressIndicator()
+                    Spacer(Modifier.height(12.dp))
+                    Text("Loading community map…")
+                } else {
+                    Text(mapError ?: "Map unavailable")
+                    Spacer(Modifier.height(12.dp))
+                    Button(onClick = {
+                        mapError = null
+                        mapReady = false
+                        mapLoadAttempt++
+                    }) { Text("Retry map") }
+                }
+            }
+        }
+    }
 }
 
 @Composable

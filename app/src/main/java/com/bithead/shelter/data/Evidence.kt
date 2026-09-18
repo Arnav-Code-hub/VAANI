@@ -13,5 +13,7 @@ data class Evidence(
     val threatLabel: String,
     val threatScore: Int,
     val sha256: String,
-    val previousHash: String?
+    val previousHash: String?,
+    val deletedFileHash: String? = null,
+    val deletedAt: Long? = null
 )

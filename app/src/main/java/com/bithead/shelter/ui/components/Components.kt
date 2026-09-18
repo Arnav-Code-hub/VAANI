@@ -25,6 +25,7 @@ import androidx.compose.material.icons.filled.Replay
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material.icons.outlined.DeleteForever
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -193,6 +194,8 @@ fun EvidenceCard(
     onStop: () -> Unit,
     onSeek: (Long) -> Unit,
     onExport: () -> Unit,
+    deletionPending: Boolean,
+    onDelete: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val severity = when {
@@ -296,7 +299,7 @@ fun EvidenceCard(
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 FilledTonalButton(
                     onClick = onPlayPause,
-                    enabled = !playback.isPreparing,
+                    enabled = !playback.isPreparing && !deletionPending,
                     modifier = Modifier.weight(1f),
                     colors = ButtonDefaults.filledTonalButtonColors(containerColor = ShelterSurfaceRaised, contentColor = MaterialTheme.colorScheme.onSurface)
                 ) {
@@ -334,6 +337,20 @@ fun EvidenceCard(
                 ) {
                     Text("Export chain of custody")
                 }
+            }
+            if (deletionPending) Text(
+                "Deletion pending — retry to remove the audio file.",
+                style = MaterialTheme.typography.bodySmall,
+                color = ShelterDanger
+            )
+            TextButton(
+                onClick = onDelete,
+                modifier = Modifier.align(Alignment.End),
+                colors = ButtonDefaults.textButtonColors(contentColor = ShelterDanger)
+            ) {
+                Icon(Icons.Outlined.DeleteForever, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(6.dp))
+                Text(if (deletionPending) "Retry delete" else "Delete recording")
             }
         }
     }
