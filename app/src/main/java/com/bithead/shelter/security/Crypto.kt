@@ -5,6 +5,7 @@ import android.security.keystore.KeyProperties
 import android.util.Base64
 import java.io.File
 import java.io.FileOutputStream
+import java.io.FileInputStream
 import java.nio.charset.StandardCharsets
 import java.security.KeyStore
 import java.security.MessageDigest
@@ -56,23 +57,44 @@ object Crypto {
         cipher.init(Cipher.ENCRYPT_MODE, key)
         val iv = cipher.iv
         check(iv.size == IV_SIZE) { "Unexpected AES-GCM IV length: ${iv.size}" }
-        val plaintext = input.readBytes()
-        val ciphertext = cipher.doFinal(plaintext)
         FileOutputStream(output).use { stream ->
             stream.write(iv)
-            stream.write(ciphertext)
+            FileInputStream(input).use { raw ->
+                val buffer = ByteArray(8192)
+                while (true) {
+                    val count = raw.read(buffer)
+                    if (count < 0) break
+                    cipher.update(buffer, 0, count)?.let(stream::write)
+                }
+            }
+            stream.write(cipher.doFinal())
             stream.fd.sync()
         }
     }
 
     fun decrypt(input: File, output: File, key: SecretKey) {
-        val bytes = input.readBytes()
-        val iv = bytes.copyOfRange(0, IV_SIZE)
-        val ciphertext = bytes.copyOfRange(IV_SIZE, bytes.size)
-        val cipher = Cipher.getInstance(TRANSFORMATION)
-        cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, iv))
-        val plaintext = cipher.doFinal(ciphertext)
-        output.writeBytes(plaintext)
+        try {
+            FileInputStream(input).use { encrypted ->
+                val iv = ByteArray(IV_SIZE)
+                require(encrypted.read(iv) == IV_SIZE) { "Evidence file is incomplete" }
+                val cipher = Cipher.getInstance(TRANSFORMATION)
+                cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, iv))
+                FileOutputStream(output).use { raw ->
+                    val buffer = ByteArray(8192)
+                    while (true) {
+                        val count = encrypted.read(buffer)
+                        if (count < 0) break
+                        cipher.update(buffer, 0, count)?.let(raw::write)
+                    }
+                    // A bad GCM tag must propagate; CipherInputStream can hide it.
+                    raw.write(cipher.doFinal())
+                    raw.fd.sync()
+                }
+            }
+        } catch (failure: Exception) {
+            output.delete()
+            throw failure
+        }
     }
 
 

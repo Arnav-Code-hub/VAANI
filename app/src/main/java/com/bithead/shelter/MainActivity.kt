@@ -1,23 +1,24 @@
 package com.bithead.shelter
 
 import android.Manifest
+import android.app.ActivityManager
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
+import android.provider.ContactsContract
+import android.provider.OpenableColumns
 import android.content.pm.PackageManager
 import android.location.Location
 import android.location.LocationManager
 import android.media.MediaPlayer
-import android.media.MediaRecorder
 import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
-import android.speech.RecognitionListener
-import android.speech.RecognizerIntent
-import android.speech.SpeechRecognizer
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.fragment.app.FragmentActivity
 import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
@@ -27,18 +28,32 @@ import androidx.compose.runtime.*
 import androidx.core.app.ActivityCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
-import com.bithead.shelter.ai.ThreatAnalyzer
 import com.bithead.shelter.ai.IncidentSummary
+import com.bithead.shelter.ai.OfflineSafeword
 import com.bithead.shelter.data.AppDatabase
 import com.bithead.shelter.data.Evidence
+import com.bithead.shelter.data.EvidenceSealer
+import com.bithead.shelter.data.TrustedContact
+import com.bithead.shelter.data.TrustedContacts
+import com.bithead.shelter.emergency.EmergencySms
+import com.bithead.shelter.emergency.AudioEvidenceFile
+import com.bithead.shelter.emergency.LocationCache
+import com.bithead.shelter.emergency.LocationTrackingService
+import com.bithead.shelter.emergency.PocketProtection
+import com.bithead.shelter.emergency.PocketProtectionService
+import com.bithead.shelter.emergency.PocketState
+import com.bithead.shelter.emergency.PocketTriggerMode
+import com.bithead.shelter.emergency.SegmentedRecorder
+import com.bithead.shelter.i18n.AppLanguage
+import com.bithead.shelter.i18n.str
 import com.bithead.shelter.security.Crypto
 import com.bithead.shelter.security.AppDisguiseManager
 import com.bithead.shelter.sensors.GestureDetector
 import com.bithead.shelter.ui.VaaniApp
 import com.bithead.shelter.ui.components.EvidencePlaybackState
+import com.bithead.shelter.ui.components.EvidenceMediaPreviewState
 import com.bithead.shelter.ui.components.SafewordDialog
 import com.bithead.shelter.ui.theme.ShelterTheme
-import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.Dispatchers
@@ -52,9 +67,6 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.io.IOException
-import java.nio.file.AtomicMoveNotSupportedException
-import java.nio.file.Files
-import java.nio.file.StandardCopyOption
 import java.util.Locale
 import javax.crypto.SecretKey
 import kotlin.coroutines.resume
@@ -63,7 +75,7 @@ class MainActivity : FragmentActivity() {
 
     private enum class CaptureState { IDLE, RECORDING, SEALING }
 
-    private data class SealResult(val entryId: Long, val rawDeleted: Boolean)
+    private data class SealResult(val entryId: Long, val chainHash: String, val rawDeleted: Boolean)
 
     private data class RecoveryResult(val recovered: Int, val failure: String? = null)
 
@@ -77,39 +89,36 @@ class MainActivity : FragmentActivity() {
     companion object {
         // Shared across Activity recreation so a new startup recovery cannot
         // race an in-flight seal owned by the previous Activity instance.
-        private val sealMutex = Mutex()
+        private val sealMutex = EvidenceSealer.mutex
 
         @Volatile
         private var startupRecoveryComplete = false
 
-        @Volatile
-        private var sealingInProgress = false
-
-        @Volatile
-        private var activeSealCompletion: CompletableDeferred<Unit>? = null
-
         private const val GESTURE_WINDOW_SECONDS = 12
         private const val GESTURE_READY_TIMEOUT_MS = 3_000L
-        private const val GESTURE_FINAL_RESULT_TIMEOUT_MS = 2_000L
     }
 
     private lateinit var db: AppDatabase
-    private var recorder: MediaRecorder? = null
-    private var rawFile: File? = null
+    private var activeIncidentId by mutableStateOf<String?>(null)
+    private var mediaSealsPending by mutableIntStateOf(0)
+    private var trustedContacts by mutableStateOf<List<TrustedContact>>(emptyList())
+    private var pendingTrackingEnable = false
     private lateinit var key: SecretKey
-    private val analyzer by lazy { ThreatAnalyzer(this) }
     private var mediaPlayer: MediaPlayer? = null
     private var playbackTempFile: File? = null
     private var playbackLoadJob: Job? = null
     private var playbackPositionJob: Job? = null
     private var playbackRequestId = 0L
-    private var speechRecognizer: SpeechRecognizer? = null
+    private var mediaPreviewTempFile: File? = null
+    private var mediaPreviewJob: Job? = null
+    private var mediaPreviewRequestId = 0L
+    private var offlineListeningJob: Job? = null
     private lateinit var gestureDetector: GestureDetector
-    private var autoStopJob: Job? = null
     private val snackbarHostState = SnackbarHostState()
 
     // ---- UI state, observed by Compose -----------------------------------
     private var captureState by mutableStateOf(CaptureState.IDLE)
+    private var serviceTriggerPending = false
     private var safewordState by mutableStateOf("HELP")
     private var threatLabel by mutableStateOf("Ready")
     private var threatScore by mutableIntStateOf(0)
@@ -120,59 +129,103 @@ class MainActivity : FragmentActivity() {
     private var communityAccuracy by mutableStateOf<Float?>(null)
     private var communityLocationTime by mutableLongStateOf(0L)
     private var showSafewordDialog by mutableStateOf(false)
-    private var liveThreatJob: Job? = null
+    private var showSafewordTest by mutableStateOf(false)
+    private var safewordTestStatus by mutableStateOf("Say your safeword when the microphone opens.")
+    private var safewordTestRunning by mutableStateOf(false)
     private var vaultUnlocked by mutableStateOf(false)
     private var biometricAvailable by mutableStateOf(true)
     private var listeningEnabled by mutableStateOf(true)
+    private var speechLanguage by mutableStateOf("system")
+    private var pocketEnabled by mutableStateOf(false)
+    private var pocketMode by mutableStateOf(PocketTriggerMode.INSTANT_RECORD)
     private var gestureWakeMode by mutableStateOf(false)
     private var safewordListeningActive by mutableStateOf(false)
     private var gestureWindowOpening by mutableStateOf(false)
     private var gestureWindowPending = false
     private var gestureWindowDeadlineMs = 0L
     private var gestureWindowSecondsRemaining by mutableIntStateOf(0)
-    private var speechRequestInFlight = false
     private var safewordActivationPending = false
     private var pendingGestureEnable = false
     private var disguiseEnabled by mutableStateOf(false)
     private var playbackState by mutableStateOf(EvidencePlaybackState())
+    private var mediaPreviewState by mutableStateOf(EvidenceMediaPreviewState())
     private var foreground = false
     private var restartListeningJob: Job? = null
     private var safewordWindowJob: Job? = null
-    private var gestureRecognitionRestartJob: Job? = null
     private var safewordActivationJob: Job? = null
     private var communityLocationJob: Job? = null
+
+    private val contactPicker = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        result.data?.data?.let { uri ->
+            runCatching {
+                contentResolver.query(uri, arrayOf(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+                    ContactsContract.CommonDataKinds.Phone.NUMBER), null, null, null)?.use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        trustedContacts = TrustedContacts.add(this, cursor.getString(0).orEmpty(), cursor.getString(1).orEmpty())
+                    }
+                }
+            }.onFailure { error ->
+                lifecycleScope.launch { snackbarHostState.showSnackbar("Could not add contact: ${error.message}") }
+            }
+        }
+    }
+    private val mediaPicker = registerForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+        if (uri != null) importMedia(uri)
+    }
+
+    override fun attachBaseContext(newBase: Context) {
+        super.attachBaseContext(AppLanguage.wrap(newBase))
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         db = AppDatabase.get(this)
         key = loadOrCreateMasterKey()
+        trustedContacts = TrustedContacts.load(this)
+        EmergencySms.restore(this)
+        LocationCache.restore(this)
         lifecycleScope.launch(Dispatchers.IO) {
-            cacheDir.listFiles { file -> file.name.startsWith("temp_play_") }
+            cacheDir.listFiles { file -> file.name.startsWith("temp_play_") ||
+                file.name.startsWith("temp_preview_") || file.name.startsWith("recovery_") }
                 ?.forEach(File::delete)
         }
         val needsStartupRecovery = !startupRecoveryComplete
-        val needsPipelineBarrier = needsStartupRecovery || sealingInProgress
+        val needsPipelineBarrier = needsStartupRecovery
         if (needsPipelineBarrier) captureState = CaptureState.SEALING
         safewordState = loadSafeword()
         listeningEnabled = getSharedPreferences("shelter_prefs", MODE_PRIVATE).getBoolean("listening", true)
+        speechLanguage = getSharedPreferences("shelter_prefs", MODE_PRIVATE)
+            .getString("speech_language", "system") ?: "system"
+        if (!OfflineSafeword.isVerified(this, safewordState, selectedSpeechLanguageTag())) {
+            listeningEnabled = false
+        }
+        pocketEnabled = PocketProtection.enabled(this)
+        pocketMode = PocketProtection.mode(this)
         gestureWakeMode = getSharedPreferences("shelter_prefs", MODE_PRIVATE).getBoolean("gesture_wake_mode", false)
         if (gestureWakeMode && !listeningEnabled) {
             listeningEnabled = true
             getSharedPreferences("shelter_prefs", MODE_PRIVATE).edit().putBoolean("listening", true).apply()
         }
         disguiseEnabled = AppDisguiseManager.isEnabled(this)
+        applyTaskIdentity(disguiseEnabled)
         AppDisguiseManager.applyLauncherState(this, disguiseEnabled)
         requestPermissionsIfNeeded()
-        initSpeechRecognizer()
-        gestureDetector = GestureDetector(this) {
-            if (gestureWakeMode && listeningEnabled && foreground) startSafewordWindow()
+        if (!OfflineSafeword.available(this)) {
+            listeningEnabled = false
+            gestureWakeMode = false
         }
+        gestureDetector = GestureDetector(this, onJerkDetected = {
+            if (gestureWakeMode && listeningEnabled && foreground) startSafewordWindow()
+        })
         checkBiometricAvailability()
 
         setContent {
             ShelterTheme {
                 val evidenceList by db.evidenceDao().observeAll().collectAsStateWithLifecycle(initialValue = emptyList())
+                val smsStatuses by EmergencySms.statuses.collectAsStateWithLifecycle()
+                val cachedLocation by LocationCache.latest.collectAsStateWithLifecycle()
+                val locationTracking by LocationCache.trackingEnabled.collectAsStateWithLifecycle()
                 VaaniApp(
                     isEmergency = captureState == CaptureState.RECORDING,
                     isSealing = captureState == CaptureState.SEALING,
@@ -204,11 +257,44 @@ class MainActivity : FragmentActivity() {
                     onPlaybackStop = { stopEvidencePlayback() },
                     onPlaybackSeek = { evidence, position -> seekEvidencePlayback(evidence, position) },
                     onExport = { exportChainOfCustody(it) },
+                    mediaPreviewState = mediaPreviewState,
+                    onOpenMedia = { openMediaPreview(it) },
+                    onCloseMedia = { closeMediaPreview() },
                     onDeleteEvidence = { deleteEvidence(it) },
+                    trustedContacts = trustedContacts,
+                    smsStatuses = smsStatuses,
+                    locationTracking = locationTracking,
+                    cachedLocation = cachedLocation,
+                    onAddContact = { name, number -> addTrustedContact(name, number) },
+                    onRemoveContact = { number -> trustedContacts = TrustedContacts.remove(this, number) },
+                    onContactLanguageChange = { number, language ->
+                        trustedContacts = TrustedContacts.setSmsLanguage(this, number, language)
+                    },
+                    onPickContact = { contactPicker.launch(Intent(Intent.ACTION_PICK, ContactsContract.CommonDataKinds.Phone.CONTENT_URI)) },
+                    onLocationTrackingChange = { updateLocationTracking(it) },
+                    onRequestSmsPermission = { ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.SEND_SMS), 11) },
+                    onImportMedia = { mediaPicker.launch(androidx.activity.result.PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)) },
+                    pendingEvidenceDir = File(filesDir, "pending"),
+                    activeIncidentId = activeIncidentId,
+                    onMediaCaptured = { sealMedia(it) },
+                    recordingCapped = PocketProtection.recordingCapped.collectAsStateWithLifecycle().value,
+                    onTamperDemo = if (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0)
+                        ({ runSafeTamperDemo() }) else null,
+                    appLanguage = AppLanguage.get(this),
+                    onAppLanguageChange = { updateAppLanguage(it) },
+                    onDisguiseShown = { shown -> applyTaskIdentity(shown || disguiseEnabled) },
                     onVerifyChain = { verifyEvidenceChain() },
                     onUnlockVault = { unlockVault() },
                     listening = listeningEnabled,
+                    speechLanguage = speechLanguage,
+                    onSpeechLanguageChange = { updateSpeechLanguage(it) },
                     listeningActive = safewordListeningActive,
+                    pocketEnabled = pocketEnabled,
+                    pocketState = PocketProtection.state.collectAsStateWithLifecycle().value.name,
+                    pocketDetail = PocketProtection.statusDetail.collectAsStateWithLifecycle().value,
+                    pocketMode = pocketMode,
+                    onPocketProtectionChange = { updatePocketProtection(it) },
+                    onPocketModeChange = { updatePocketMode(it) },
                     onListeningChange = { updateListeningEnabled(it) },
                     gestureWakeMode = gestureWakeMode,
                     gestureWindowOpening = gestureWindowOpening,
@@ -216,15 +302,32 @@ class MainActivity : FragmentActivity() {
                     onGestureWakeModeChange = { updateGestureWakeMode(it) },
                     disguiseEnabled = disguiseEnabled,
                     onDisguiseEnabledChange = { updateAppDisguise(it) },
-                    onLockVault = { stopEvidencePlayback(); vaultUnlocked = false },
-                    onVaultHidden = { stopEvidencePlayback() },
+                    onLockVault = { stopEvidencePlayback(); closeMediaPreview(); vaultUnlocked = false },
+                    onVaultHidden = { stopEvidencePlayback(); closeMediaPreview() },
                     onRefreshMapLocation = { refreshCommunityLocation() }
                 )
                 if (showSafewordDialog) {
                     SafewordDialog(
                         current = safewordState,
                         onDismiss = { showSafewordDialog = false },
-                        onSave = { saveSafeword(it); showSafewordDialog = false }
+                        onSave = { saveSafeword(it); showSafewordDialog = false; showSafewordTest = true }
+                    )
+                }
+                if (showSafewordTest) {
+                    AlertDialog(
+                        onDismissRequest = { if (!safewordTestRunning) showSafewordTest = false },
+                        title = { Text("Test offline safeword") },
+                        text = { Text(safewordTestStatus) },
+                        confirmButton = {
+                            TextButton(onClick = { testOfflineSafeword() }, enabled = !safewordTestRunning) {
+                                Text("Record 4-second test")
+                            }
+                        },
+                        dismissButton = {
+                            TextButton(onClick = { showSafewordTest = false }, enabled = !safewordTestRunning) {
+                                Text("Close")
+                            }
+                        }
                     )
                 }
             }
@@ -233,13 +336,45 @@ class MainActivity : FragmentActivity() {
             lifecycleScope.launch {
                 try {
                     if (needsStartupRecovery) recoverOrphanedEvidence()
-                    awaitActiveSeal()
                 } finally {
-                    captureState = CaptureState.IDLE
+                    captureState = when (PocketProtection.state.value) {
+                        PocketState.RECORDING -> CaptureState.RECORDING
+                        PocketState.SEALING -> CaptureState.SEALING
+                        else -> CaptureState.IDLE
+                    }
                     if (!gestureWakeMode) restartSafewordListening()
                 }
             }
         }
+        lifecycleScope.launch {
+            PocketProtection.state.collect { state ->
+                if (!startupRecoveryComplete) return@collect
+                captureState = when (state) {
+                    PocketState.RECORDING -> CaptureState.RECORDING
+                    PocketState.SEALING -> CaptureState.SEALING
+                    else -> CaptureState.IDLE
+                }
+                if (state in setOf(PocketState.STARTING, PocketState.LISTENING, PocketState.RECORDING)) {
+                    cancelSafewordSession()
+                }
+                if (state in setOf(PocketState.ARMED, PocketState.DISARMED) && foreground) {
+                    restartSafewordListening()
+                }
+                if (state == PocketState.RECORDING || state == PocketState.ERROR) serviceTriggerPending = false
+                if (state == PocketState.ERROR) {
+                    startupRecoveryComplete = false
+                    recoverOrphanedEvidence()
+                    snackbarHostState.showSnackbar(
+                        "Background recording needs attention. Pending raw evidence was preserved for recovery."
+                    )
+                }
+            }
+        }
+        lifecycleScope.launch { PocketProtection.activeIncidentId.collect { activeIncidentId = it } }
+        lifecycleScope.launch { PocketProtection.threat.collect { threat ->
+            threatLabel = threat.label
+            threatScore = threat.score
+        } }
     }
 
     // ---- Keys & prefs -------------------------------------------------------
@@ -257,7 +392,52 @@ class MainActivity : FragmentActivity() {
 
     private fun saveSafeword(newWord: String) {
         safewordState = newWord.trim().uppercase(Locale.getDefault())
-        getSharedPreferences("shelter_prefs", MODE_PRIVATE).edit().putString("user_safeword", safewordState).apply()
+        listeningEnabled = false
+        gestureWakeMode = false
+        cancelSafewordSession()
+        getSharedPreferences("shelter_prefs", MODE_PRIVATE).edit()
+            .putString("user_safeword", safewordState)
+            .putBoolean("listening", false)
+            .putBoolean("gesture_wake_mode", false).apply()
+    }
+
+    private fun selectedSpeechLanguageTag(): String =
+        if (speechLanguage == "system") Locale.getDefault().toLanguageTag() else speechLanguage
+
+    private fun testOfflineSafeword() {
+        if (safewordTestRunning || captureState != CaptureState.IDLE) return
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            safewordTestStatus = "Microphone permission is required for the test."
+            requestPermissionsIfNeeded()
+            return
+        }
+        cancelSafewordSession()
+        safewordTestRunning = true
+        safewordTestStatus = "Opening microphone…"
+        lifecycleScope.launch {
+            try {
+                val samples = OfflineSafeword.capture(this@MainActivity, 4_000L) {
+                    runOnUiThread { safewordTestStatus = "Listening for 4 seconds…" }
+                }
+                safewordTestStatus = "Checking the phrase on this device…"
+                val tag = selectedSpeechLanguageTag()
+                val inferenceStarted = SystemClock.elapsedRealtime()
+                val heard = OfflineSafeword.transcribe(this@MainActivity, samples, tag)
+                val inferenceMs = SystemClock.elapsedRealtime() - inferenceStarted
+                if (heard.contains(safewordState, ignoreCase = true) && inferenceMs <= 3_500L) {
+                    OfflineSafeword.markVerified(this@MainActivity, safewordState, tag)
+                    safewordTestStatus = "Test passed in ${inferenceMs} ms. You can now enable Safeword Protection."
+                } else if (inferenceMs > 3_500L) {
+                    safewordTestStatus = "Voice recognition took ${inferenceMs} ms, too slow for reliable arming on this phone. Use the manual alert or instant pocket trigger."
+                } else {
+                    safewordTestStatus = "Test failed. Heard: ${heard.ifBlank { "nothing" }}. Try again in a quiet place."
+                }
+            } catch (error: Exception) {
+                safewordTestStatus = "Offline test failed: ${error.message}"
+            } finally {
+                safewordTestRunning = false
+            }
+        }
     }
 
     private fun requestPermissionsIfNeeded() {
@@ -375,9 +555,40 @@ class MainActivity : FragmentActivity() {
     )
 
     private fun updateAppDisguise(enabled: Boolean) {
-        if (enabled) stopEvidencePlayback()
+        if (enabled) {
+            stopEvidencePlayback()
+            closeMediaPreview()
+            vaultUnlocked = false
+        }
         AppDisguiseManager.setEnabled(this, enabled)
         disguiseEnabled = enabled
+        applyTaskIdentity(enabled)
+    }
+
+    private fun applyTaskIdentity(disguised: Boolean) {
+        val label = if (disguised) str(R.string.notes) else "VAANI"
+        val background = ContextCompat.getColor(this,
+            if (disguised) R.color.notes_icon_background else R.color.vaani_icon_background)
+        @Suppress("DEPRECATION")
+        val description = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            ActivityManager.TaskDescription(label,
+                if (disguised) R.drawable.ic_notes_task else R.drawable.vaani_logo, background)
+        } else {
+            ActivityManager.TaskDescription(label)
+        }
+        setTaskDescription(description)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) setRecentsScreenshotEnabled(!disguised)
+    }
+
+    private fun updateAppLanguage(tag: String) {
+        val pocketBusy = PocketProtection.state.value.name in setOf("RECORDING", "SEALING")
+        if (captureState != CaptureState.IDLE || pocketBusy || mediaSealsPending > 0) {
+            lifecycleScope.launch { snackbarHostState.showSnackbar(str(R.string.language_change_blocked)) }
+            return
+        }
+        if (tag == AppLanguage.get(this)) return
+        AppLanguage.set(this, tag)
+        recreate()
     }
 
     private fun refreshCommunityLocation() {
@@ -388,88 +599,95 @@ class MainActivity : FragmentActivity() {
                 communityLng = fix.longitude
                 communityAccuracy = fix.accuracyMeters
                 communityLocationTime = fix.timestampMillis
+                LocationCache.save(this@MainActivity,
+                    com.bithead.shelter.emergency.CachedLocation(fix.latitude, fix.longitude, fix.timestampMillis, fix.accuracyMeters))
+            }
+        }
+    }
+
+    private fun addTrustedContact(name: String, number: String) {
+        runCatching { TrustedContacts.add(this, name, number) }
+            .onSuccess { trustedContacts = it }
+            .onFailure { error -> lifecycleScope.launch { snackbarHostState.showSnackbar(error.message ?: "Invalid contact") } }
+    }
+
+    private fun updateLocationTracking(enabled: Boolean) {
+        if (!enabled) {
+            LocationCache.setEnabled(this, false)
+            stopService(Intent(this, LocationTrackingService::class.java))
+            return
+        }
+        if (!hasLocationPermission()) {
+            pendingTrackingEnable = true
+            ActivityCompat.requestPermissions(this,
+                arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION), 10)
+            return
+        }
+        LocationCache.setEnabled(this, true)
+        startLocationProtection()
+        if (android.os.Build.VERSION.SDK_INT >= 33 &&
+            ActivityCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 12)
+        }
+    }
+
+    private fun startLocationProtection() {
+        try {
+            ContextCompat.startForegroundService(this,
+                Intent(this, LocationTrackingService::class.java).setAction(LocationTrackingService.ACTION_START))
+        } catch (error: Exception) {
+            lifecycleScope.launch { snackbarHostState.showSnackbar("Location protection could not start: ${error.message}") }
+        }
+    }
+
+    private fun importMedia(uri: Uri) {
+        if (captureState == CaptureState.SEALING || mediaSealsPending > 0) {
+            lifecycleScope.launch { snackbarHostState.showSnackbar("Wait for the current evidence to finish sealing") }
+            return
+        }
+        val mime = contentResolver.getType(uri).orEmpty()
+        val type = when {
+            mime.startsWith("image/") -> "image"
+            mime.startsWith("video/") -> "video"
+            else -> {
+                lifecycleScope.launch { snackbarHostState.showSnackbar("Choose an image or video") }
+                return
+            }
+        }
+        val extension = when (mime) {
+            "image/png" -> "png"
+            "image/webp" -> "webp"
+            "image/heic", "image/heif" -> "heic"
+            else -> if (type == "video") "mp4" else "jpg"
+        }
+        val size = contentResolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use {
+            if (it.moveToFirst()) it.getLong(0) else 0L
+        } ?: 0L
+        if (size > 250L * 1024 * 1024) {
+            lifecycleScope.launch { snackbarHostState.showSnackbar("Choose a file under 250 MB") }
+            return
+        }
+        val session = activeIncidentId ?: System.currentTimeMillis().toString()
+        lifecycleScope.launch {
+            try {
+                val raw = withContext(Dispatchers.IO) {
+                    val directory = File(filesDir, "pending").apply { mkdirs() }
+                    val timestamp = System.currentTimeMillis()
+                    val target = File(directory, "evidence_${timestamp}_${type}_${session}.raw.$extension")
+                    contentResolver.openInputStream(uri).use { source ->
+                        requireNotNull(source) { "Cannot open the selected media" }
+                        target.outputStream().use { output -> source.copyTo(output) }
+                    }
+                    target
+                }
+                sealMedia(raw)
+            } catch (error: Exception) {
+                snackbarHostState.showSnackbar("Media import failed: ${error.message}")
             }
         }
     }
 
     // ---- Safeword voice trigger ----------------------------------------------
-
-    private fun initSpeechRecognizer() {
-        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
-            listeningEnabled = false
-            gestureWakeMode = false
-            getSharedPreferences("shelter_prefs", MODE_PRIVATE).edit()
-                .putBoolean("listening", false)
-                .putBoolean("gesture_wake_mode", false)
-                .apply()
-            return
-        }
-        speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this).apply {
-            setRecognitionListener(object : RecognitionListener {
-                override fun onReadyForSpeech(params: Bundle?) {
-                    speechRequestInFlight = false
-                    if (captureState != CaptureState.IDLE) return
-                    safewordListeningActive = true
-                    if (gestureWakeMode && gestureWindowPending) {
-                        gestureWindowOpening = false
-                        if (gestureWindowDeadlineMs == 0L) {
-                            gestureWindowDeadlineMs = SystemClock.elapsedRealtime() + GESTURE_WINDOW_SECONDS * 1_000L
-                            getSystemService(Vibrator::class.java)?.takeIf { it.hasVibrator() }?.vibrate(
-                                VibrationEffect.createOneShot(30L, VibrationEffect.DEFAULT_AMPLITUDE)
-                            )
-                            startGestureWindowCountdown()
-                        }
-                    }
-                }
-                override fun onBeginningOfSpeech() {}
-                override fun onRmsChanged(rmsdB: Float) {}
-                override fun onBufferReceived(buffer: ByteArray?) {}
-                override fun onEndOfSpeech() {}
-                override fun onError(error: Int) {
-                    val wasGestureWindow = gestureWakeMode && gestureWindowPending
-                    speechRequestInFlight = false
-                    safewordListeningActive = false
-                    if (wasGestureWindow) {
-                        val retryable = error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT
-                        if (!retryable || !restartGestureRecognitionIfTimeRemains()) {
-                            finishGestureWindow(cancelRecognizer = false)
-                            lifecycleScope.launch {
-                                snackbarHostState.showSnackbar(speechErrorMessage(error))
-                            }
-                        }
-                    } else if (captureState == CaptureState.IDLE && !gestureWakeMode) {
-                        restartSafewordListening()
-                    }
-                }
-                override fun onResults(results: Bundle?) {
-                    val wasGestureWindow = gestureWakeMode && gestureWindowPending
-                    val matched = checkSafewordMatches(results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION))
-                    speechRequestInFlight = false
-                    safewordListeningActive = false
-                    if (wasGestureWindow && !matched && !restartGestureRecognitionIfTimeRemains()) {
-                        finishGestureWindow(cancelRecognizer = false)
-                    }
-                    if (captureState == CaptureState.IDLE && !gestureWakeMode && !matched) restartSafewordListening()
-                }
-                override fun onPartialResults(partialResults: Bundle?) {
-                    checkSafewordMatches(partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION))
-                }
-                override fun onEvent(eventType: Int, params: Bundle?) {}
-            })
-        }
-    }
-
-    private fun speechErrorMessage(error: Int): String = when (error) {
-        SpeechRecognizer.ERROR_NO_MATCH, SpeechRecognizer.ERROR_SPEECH_TIMEOUT ->
-            "Safeword not heard — gesture remains armed"
-        SpeechRecognizer.ERROR_RECOGNIZER_BUSY ->
-            "Speech recognizer was busy — wait a moment and jerk again"
-        SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS ->
-            "Microphone permission is required for the safeword window"
-        SpeechRecognizer.ERROR_NETWORK, SpeechRecognizer.ERROR_NETWORK_TIMEOUT ->
-            "Speech recognition is unavailable offline on this device"
-        else -> "Safeword window closed — gesture remains armed"
-    }
 
     private fun checkSafewordMatches(matches: ArrayList<String>?): Boolean {
         if (captureState != CaptureState.IDLE || !listeningEnabled || !foreground || safewordActivationPending ||
@@ -485,9 +703,8 @@ class MainActivity : FragmentActivity() {
         restartListeningJob?.cancel()
         if (gestureWakeMode) finishGestureWindow(cancelRecognizer = true)
         else {
-            speechRequestInFlight = false
             safewordListeningActive = false
-            speechRecognizer?.cancel()
+            offlineListeningJob?.cancel()
         }
         safewordActivationJob?.cancel()
         safewordActivationJob = lifecycleScope.launch {
@@ -498,28 +715,55 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun startSafewordListening(): Boolean {
-        if (captureState != CaptureState.IDLE || !foreground || !listeningEnabled || speechRecognizer == null ||
-            speechRequestInFlight || safewordListeningActive ||
+        if (captureState != CaptureState.IDLE || !foreground || !listeningEnabled ||
+            PocketProtection.state.value in setOf(PocketState.STARTING, PocketState.LISTENING, PocketState.RECORDING) ||
+            offlineListeningJob?.isActive == true ||
             ActivityCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) return false
-        try {
-            val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault())
-                putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-                // Prefer the on-device recognizer where the OS/device supports it,
-                // so the safeword phrase isn't sent to a cloud speech API by default.
-                // NOTE: not all Android versions/devices honor this — see README
-                // "Known limitations" for the real offline-guarantee status.
-                putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+
+        val window = gestureWakeMode
+        offlineListeningJob = lifecycleScope.launch {
+            try {
+                if (window) {
+                    val audio = OfflineSafeword.capture(this@MainActivity,
+                        GESTURE_WINDOW_SECONDS * 1_000L) {
+                        runOnUiThread {
+                            safewordListeningActive = true
+                            if (gestureWindowPending) {
+                                gestureWindowOpening = false
+                                gestureWindowDeadlineMs = SystemClock.elapsedRealtime() + GESTURE_WINDOW_SECONDS * 1_000L
+                                getSystemService(Vibrator::class.java)?.takeIf { it.hasVibrator() }?.vibrate(
+                                    VibrationEffect.createOneShot(30L, VibrationEffect.DEFAULT_AMPLITUDE))
+                                startGestureWindowCountdown()
+                            }
+                        }
+                    }
+                    safewordListeningActive = false
+                    val phrase = OfflineSafeword.transcribe(this@MainActivity, audio, selectedSpeechLanguageTag())
+                    checkSafewordMatches(arrayListOf(phrase))
+                    if (gestureWindowPending) finishGestureWindow(cancelRecognizer = false)
+                } else {
+                    OfflineSafeword.stream(this@MainActivity, selectedSpeechLanguageTag(),
+                        onReady = { runOnUiThread { safewordListeningActive = true } },
+                        onPhrase = { phrase -> withContext(Dispatchers.Main) {
+                            checkSafewordMatches(arrayListOf(phrase))
+                        } })
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                if (window) finishGestureWindow(cancelRecognizer = false)
+                else {
+                    listeningEnabled = false
+                    getSharedPreferences("shelter_prefs", MODE_PRIVATE).edit().putBoolean("listening", false).apply()
+                }
+                snackbarHostState.showSnackbar("Offline safeword failed: ${error.message}")
+            } finally {
+                safewordListeningActive = false
+                offlineListeningJob = null
+                if (!window) restartSafewordListening()
             }
-            speechRequestInFlight = true
-            speechRecognizer?.startListening(intent)
-            return true
-        } catch (_: Exception) {
-            speechRequestInFlight = false
-            safewordListeningActive = false
-            return false
         }
+        return true
     }
 
     private fun startSafewordWindow() {
@@ -559,24 +803,7 @@ class MainActivity : FragmentActivity() {
             if (!gestureWindowPending) return@launch
             gestureWindowSecondsRemaining = 0
             safewordListeningActive = false
-            speechRecognizer?.stopListening()
-            delay(GESTURE_FINAL_RESULT_TIMEOUT_MS)
-            if (gestureWindowPending) finishGestureWindow(cancelRecognizer = true)
         }
-    }
-
-    private fun restartGestureRecognitionIfTimeRemains(): Boolean {
-        if (!gestureWindowPending || gestureWindowDeadlineMs <= SystemClock.elapsedRealtime()) return false
-        gestureWindowOpening = true
-        gestureRecognitionRestartJob?.cancel()
-        gestureRecognitionRestartJob = lifecycleScope.launch {
-            delay(150L)
-            if (gestureWindowPending && !startSafewordListening()) {
-                finishGestureWindow(cancelRecognizer = true)
-                snackbarHostState.showSnackbar("Could not reopen the safeword listener — gesture remains armed")
-            }
-        }
-        return true
     }
 
     private fun finishGestureWindow(cancelRecognizer: Boolean) {
@@ -584,13 +811,10 @@ class MainActivity : FragmentActivity() {
         gestureWindowOpening = false
         gestureWindowDeadlineMs = 0L
         gestureWindowSecondsRemaining = 0
-        speechRequestInFlight = false
         safewordListeningActive = false
         safewordWindowJob?.cancel()
         safewordWindowJob = null
-        gestureRecognitionRestartJob?.cancel()
-        gestureRecognitionRestartJob = null
-        if (cancelRecognizer) speechRecognizer?.cancel()
+        if (cancelRecognizer) offlineListeningJob?.cancel()
     }
 
     private fun cancelSafewordSession() {
@@ -602,15 +826,21 @@ class MainActivity : FragmentActivity() {
 
     private fun restartSafewordListening() {
         restartListeningJob?.cancel()
-        if (listeningEnabled && foreground && captureState == CaptureState.IDLE && !gestureWakeMode) {
+        if (listeningEnabled && foreground && captureState == CaptureState.IDLE && !gestureWakeMode &&
+            PocketProtection.state.value !in setOf(PocketState.STARTING, PocketState.LISTENING, PocketState.RECORDING)) {
             restartListeningJob = lifecycleScope.launch { delay(1000); startSafewordListening() }
         }
     }
 
     private fun updateListeningEnabled(enabled: Boolean) {
-        if (enabled && (speechRecognizer == null ||
+        if (enabled && !OfflineSafeword.isVerified(this, safewordState, selectedSpeechLanguageTag())) {
+            safewordTestStatus = "Say your safeword in a local test before voice protection can be enabled."
+            showSafewordTest = true
+            return
+        }
+        if (enabled && (!OfflineSafeword.available(this) ||
                 ActivityCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED)) {
-            lifecycleScope.launch { snackbarHostState.showSnackbar("Enable microphone access and a speech recognition service to listen for your safeword") }
+            lifecycleScope.launch { snackbarHostState.showSnackbar("Offline speech recognition and microphone permission are required for the safeword") }
             requestPermissionsIfNeeded()
             return
         }
@@ -625,12 +855,17 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun updateGestureWakeMode(enabled: Boolean) {
+        if (enabled && !OfflineSafeword.isVerified(this, safewordState, selectedSpeechLanguageTag())) {
+            safewordTestStatus = "Test this language and safeword locally before enabling Gesture-Wake."
+            showSafewordTest = true
+            return
+        }
         if (enabled && !gestureDetector.isAvailable) {
             lifecycleScope.launch { snackbarHostState.showSnackbar("This device has no accelerometer for Gesture-Wake") }
             return
         }
-        if (enabled && speechRecognizer == null) {
-            lifecycleScope.launch { snackbarHostState.showSnackbar("No speech recognition service is available on this device") }
+        if (enabled && !OfflineSafeword.available(this)) {
+            lifecycleScope.launch { snackbarHostState.showSnackbar("Offline speech recognition is unavailable on this device; use manual or instant gesture recording") }
             return
         }
         if (enabled && ActivityCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
@@ -653,9 +888,67 @@ class MainActivity : FragmentActivity() {
         if (!enabled && listeningEnabled && foreground) restartSafewordListening()
     }
 
+    private fun updateSpeechLanguage(language: String) {
+        speechLanguage = language.takeIf { it in setOf("system", "en-IN", "hi-IN", "bn-IN", "mr-IN", "ta-IN") } ?: "system"
+        getSharedPreferences("shelter_prefs", MODE_PRIVATE).edit()
+            .putString("speech_language", speechLanguage).apply()
+        cancelSafewordSession()
+        if (!OfflineSafeword.isVerified(this, safewordState, selectedSpeechLanguageTag())) {
+            listeningEnabled = false
+            gestureWakeMode = false
+            getSharedPreferences("shelter_prefs", MODE_PRIVATE).edit()
+                .putBoolean("listening", false).putBoolean("gesture_wake_mode", false).apply()
+            safewordTestStatus = "Test the safeword in the selected language before arming voice protection."
+            showSafewordTest = true
+        }
+    }
+
+    private fun updatePocketMode(mode: PocketTriggerMode) {
+        if (mode == PocketTriggerMode.SAFEWORD_WINDOW &&
+            !OfflineSafeword.isVerified(this, safewordState, selectedSpeechLanguageTag())) {
+            safewordTestStatus = "Test this safeword locally before using the pocket voice window."
+            showSafewordTest = true
+            return
+        }
+        pocketMode = mode
+        PocketProtection.setMode(this, mode)
+    }
+
+    private fun updatePocketProtection(enabled: Boolean) {
+        if (enabled) {
+            if (pocketMode == PocketTriggerMode.SAFEWORD_WINDOW &&
+                !OfflineSafeword.isVerified(this, safewordState, selectedSpeechLanguageTag())) {
+                safewordTestStatus = "Test this safeword locally before arming pocket voice protection."
+                showSafewordTest = true
+                return
+            }
+            if (ActivityCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                lifecycleScope.launch { snackbarHostState.showSnackbar("Microphone permission is required for Pocket Protection") }
+                requestPermissionsIfNeeded()
+                return
+            }
+            if (Build.VERSION.SDK_INT >= 33 && ActivityCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 12)
+            }
+            pocketEnabled = true
+            PocketProtection.setEnabled(this, true)
+            val intent = Intent(this, PocketProtectionService::class.java).setAction(PocketProtectionService.ACTION_ARM)
+            ContextCompat.startForegroundService(this, intent)
+        } else {
+            pocketEnabled = false
+            PocketProtection.setEnabled(this, false)
+            startService(Intent(this, PocketProtectionService::class.java).setAction(PocketProtectionService.ACTION_DISARM))
+        }
+    }
+
     override fun onResume() {
         super.onResume()
         foreground = true
+        if (PocketProtection.enabled(this) && PocketProtection.state.value == PocketState.DISARMED) {
+            runCatching { ContextCompat.startForegroundService(this,
+                Intent(this, PocketProtectionService::class.java).setAction(PocketProtectionService.ACTION_ARM)) }
+        }
+        if (LocationCache.trackingEnabled.value && hasLocationPermission()) startLocationProtection()
         checkBiometricAvailability()
         val sensorStarted = gestureDetector.start()
         if (gestureWakeMode && !sensorStarted) {
@@ -691,231 +984,99 @@ class MainActivity : FragmentActivity() {
                 startSafewordListening()
             }
             if (hasLocationPermission()) refreshCommunityLocation()
+            if (pendingTrackingEnable && hasLocationPermission()) {
+                pendingTrackingEnable = false
+                updateLocationTracking(true)
+            }
+        } else if (requestCode == 11) {
+            lifecycleScope.launch {
+                snackbarHostState.showSnackbar(if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED)
+                    "SMS alerts are ready" else "SMS permission denied — emergency recording still works")
+            }
         }
     }
 
     // ---- Emergency capture -----------------------------------------------------
 
     private fun activateEmergency() {
-        if (captureState != CaptureState.IDLE || sealingInProgress) return
+        if (captureState != CaptureState.IDLE || serviceTriggerPending ||
+            PocketProtection.state.value in setOf(PocketState.RECORDING, PocketState.SEALING)) return
         if (ActivityCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             lifecycleScope.launch { snackbarHostState.showSnackbar("Microphone permission denied — cannot record evidence") }
             requestPermissionsIfNeeded()
             return
         }
         stopEvidencePlayback()
-        restartListeningJob?.cancel()
-        safewordWindowJob?.cancel()
-        safewordListeningActive = false
-        captureState = CaptureState.RECORDING
-        threatLabel = "Monitoring peaks…"
-        threatScore = 0
-        speechRecognizer?.cancel()
-
-        // Live-tick the threat meter in the UI while recording, instead of
-        // only showing a number after the fact.
-        liveThreatJob?.cancel()
-        liveThreatJob = lifecycleScope.launch {
-            analyzer.liveResult.collect { live ->
-                if (captureState == CaptureState.RECORDING) {
-                    threatLabel = live.label
-                    threatScore = live.score
-                }
-            }
-        }
-
+        cancelSafewordSession()
+        serviceTriggerPending = true
         try {
-            val pendingDir = File(filesDir, "pending")
-            if (!pendingDir.exists() && !pendingDir.mkdirs()) {
-                throw IOException("Could not create private pending-evidence storage")
-            }
-            val captureId = System.currentTimeMillis()
-            val file = File(pendingDir, "evidence_$captureId.raw.m4a")
-            rawFile = file
-            recorder = (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) MediaRecorder(this) else @Suppress("DEPRECATION") MediaRecorder()).apply {
-                setAudioSource(MediaRecorder.AudioSource.MIC)
-                setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-                setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-                setOutputFile(file.absolutePath)
-                prepare()
-                start()
-            }
-            // The evidence recorder gets the microphone first. Starting the
-            // analyzer before MediaRecorder can starve or reject capture on
-            // devices that do not support concurrent microphone clients.
-            analyzer.startListening()
-
-            autoStopJob?.cancel()
-            autoStopJob = lifecycleScope.launch {
-                delay(5 * 60 * 1000L)
-                if (captureState == CaptureState.RECORDING) stopEmergency()
-            }
-        } catch (e: Exception) {
-            runCatching { recorder?.release() }
-            recorder = null
-            analyzer.stopAndAnalyze()
-            val preservedRaw = rawFile?.takeIf { it.exists() }
-            rawFile = null
-            threatLabel = "Recording failed: ${e.message}"
-            captureState = CaptureState.IDLE
+            ContextCompat.startForegroundService(this,
+                Intent(this, PocketProtectionService::class.java).setAction(PocketProtectionService.ACTION_TRIGGER_RECORDING))
             lifecycleScope.launch {
-                val preserved = if (preservedRaw != null) " Any captured bytes were retained for recovery." else ""
-                snackbarHostState.showSnackbar("Recording could not start: ${e.message ?: "microphone unavailable"}.$preserved")
+                delay(3_000L)
+                serviceTriggerPending = false
             }
-            if (!gestureWakeMode) restartSafewordListening()
+        } catch (error: Exception) {
+            serviceTriggerPending = false
+            lifecycleScope.launch { snackbarHostState.showSnackbar("Recording could not start: ${error.message}") }
         }
     }
 
     private fun stopEmergency() {
-        if (captureState != CaptureState.RECORDING) return
-        val sealCompletion = CompletableDeferred<Unit>()
-        activeSealCompletion = sealCompletion
-        sealingInProgress = true
-        captureState = CaptureState.SEALING
-        liveThreatJob?.cancel()
-        liveThreatJob = null
-        autoStopJob?.cancel()
-        autoStopJob = null
+        if (PocketProtection.state.value != PocketState.RECORDING) return
+        startService(Intent(this, PocketProtectionService::class.java).setAction(PocketProtectionService.ACTION_STOP))
+    }
 
-        val result = analyzer.stopAndAnalyze()
-        val recorderStopped = recorder?.runCatching { stop() }?.isSuccess == true
-        runCatching { recorder?.release() }
-        recorder = null
-        val raw = rawFile
-        rawFile = null
+    private suspend fun sealEvidence(
+        raw: File, label: String, score: Int,
+        mediaType: String = "AUDIO", mimeType: String = "audio/mp4", incidentId: String? = null
+    ): SealResult {
+        val result = EvidenceSealer.seal(this, db, key, EvidenceSealer.Request(
+            raw = raw,
+            label = label,
+            score = score,
+            mediaType = mediaType,
+            mimeType = mimeType,
+            incidentId = incidentId
+        ))
+        return SealResult(result.entryId, result.chainHash, result.rawDeleted)
+    }
 
-        if (!recorderStopped || raw == null || !raw.exists() || raw.length() == 0L) {
-            threatLabel = "Recording could not be finalized"
-            finishActiveSeal(sealCompletion)
-            captureState = CaptureState.IDLE
-            lifecycleScope.launch {
-                snackbarHostState.showSnackbar(
-                    "Evidence could not be finalized. The pending raw file was retained for recovery."
-                )
-            }
-            if (!gestureWakeMode) restartSafewordListening()
+    private fun sealMedia(raw: File) {
+        val match = Regex("^evidence_(\\d+)_(image|video)_(\\d+)\\.raw\\.(jpg|png|webp|heic|mp4)$")
+            .matchEntire(raw.name)
+        if (match == null || !raw.exists() || raw.length() == 0L) {
+            lifecycleScope.launch { snackbarHostState.showSnackbar("Media capture is incomplete; no vault entry was created") }
             return
         }
-
+        val kind = match.groupValues[2]
+        val session = match.groupValues[3]
+        val extension = match.groupValues[4]
+        val mime = when (extension) {
+            "jpg" -> "image/jpeg"
+            "png" -> "image/png"
+            "webp" -> "image/webp"
+            "heic" -> "image/heic"
+            else -> "video/mp4"
+        }
+        mediaSealsPending++
         lifecycleScope.launch {
-            var sealFailure: Exception? = null
-            val sealed = try {
-                sealEvidence(raw, result.label, result.score)
-            } catch (e: Exception) {
-                sealFailure = e
-                null
-            } finally {
-                finishActiveSeal(sealCompletion)
-                captureState = CaptureState.IDLE
-                if (!gestureWakeMode) restartSafewordListening()
-            }
-
-            if (sealed == null) {
-                val failure = sealFailure
-                threatLabel = "Sealing failed: ${failure?.message}"
-                snackbarHostState.showSnackbar(
-                    "Evidence could not be sealed: ${failure?.message ?: "storage error"}. Raw audio was retained for recovery."
-                )
-                return@launch
-            }
-
-            threatLabel = result.label
-            threatScore = result.score
-            snackbarHostState.showSnackbar(
-                if (sealed.rawDeleted) {
-                    "Evidence sealed and added to the vault ✓"
-                } else {
-                    "Evidence sealed. The encrypted record is safe, but plaintext cleanup needs attention."
-                }
-            )
-
-            // Location is optional metadata. It must never block the
-            // evidence row from appearing in the Vault or invalidate it.
-            runCatching {
-                getLocation()?.let { fix ->
-                    lastLat = fix.latitude
-                    lastLng = fix.longitude
+            try {
+                val sealed = sealEvidence(raw, if (kind == "video") "Video evidence" else "Image evidence", 0,
+                    kind.uppercase(Locale.US), mime, session)
+                LocationCache.latest.value?.let { fix ->
                     withContext(Dispatchers.IO) {
                         db.evidenceDao().updateLocation(sealed.entryId, fix.latitude, fix.longitude)
                     }
                 }
+                snackbarHostState.showSnackbar(if (sealed.rawDeleted) "Media sealed in Vault" else
+                    "Media sealed; private temporary file cleanup needs attention")
+            } catch (error: Exception) {
+                snackbarHostState.showSnackbar("Media could not be sealed: ${error.message}. Private raw file retained for recovery")
+            } finally {
+                mediaSealsPending--
             }
         }
-    }
-
-    private suspend fun sealEvidence(raw: File, label: String, score: Int): SealResult =
-        withContext(NonCancellable + Dispatchers.IO) {
-            sealMutex.withLock {
-                val createdAt = raw.name
-                    .removePrefix("evidence_")
-                    .removeSuffix(".raw.m4a")
-                    .toLongOrNull()
-                    ?: raw.lastModified().takeIf { it > 0L }
-                    ?: System.currentTimeMillis()
-                val encrypted = File(filesDir, "evidence_$createdAt.enc")
-                val temporary = File(filesDir, "${encrypted.name}.tmp")
-                var finalized = false
-                var committed = false
-
-                try {
-                    if (encrypted.exists()) throw IOException("Evidence destination already exists")
-                    if (temporary.exists() && !temporary.delete()) {
-                        throw IOException("Could not clear an old temporary evidence file")
-                    }
-
-                    Crypto.encrypt(raw, temporary, key)
-                    moveAtomically(temporary, encrypted)
-                    finalized = true
-
-                    val fileHash = Crypto.sha256(encrypted)
-                    val entryId = db.evidenceDao().insertChained(
-                        Evidence(
-                            createdAt = createdAt,
-                            encryptedFile = encrypted.name,
-                            latitude = null,
-                            longitude = null,
-                            threatLabel = label,
-                            threatScore = score,
-                            sha256 = "",
-                            previousHash = null
-                        ),
-                        fileHash
-                    )
-                    committed = true
-                    SealResult(entryId, raw.delete())
-                } catch (failure: Exception) {
-                    temporary.delete()
-                    if (finalized && !committed) {
-                        val lookup = runCatching { db.evidenceDao().entryIdForFile(encrypted.name) }
-                        if (lookup.isSuccess && lookup.getOrNull() != null) {
-                            return@withLock SealResult(lookup.getOrThrow()!!, raw.delete())
-                        }
-                        // Delete only when Room positively confirms that the
-                        // transaction did not commit. Otherwise leave the final
-                        // file for startup recovery to reconcile safely.
-                        if (lookup.isSuccess) encrypted.delete()
-                    }
-                    throw failure
-                }
-            }
-        }
-
-    private fun moveAtomically(source: File, destination: File) {
-        try {
-            Files.move(source.toPath(), destination.toPath(), StandardCopyOption.ATOMIC_MOVE)
-        } catch (_: AtomicMoveNotSupportedException) {
-            Files.move(source.toPath(), destination.toPath())
-        }
-    }
-
-    private fun finishActiveSeal(completion: CompletableDeferred<Unit>) {
-        sealingInProgress = false
-        completion.complete(Unit)
-        if (activeSealCompletion === completion) activeSealCompletion = null
-    }
-
-    private suspend fun awaitActiveSeal() {
-        activeSealCompletion?.await()
     }
 
     /**
@@ -985,6 +1146,7 @@ class MainActivity : FragmentActivity() {
         cancelSafewordSession()
         communityLocationJob?.cancel()
         stopEvidencePlayback()
+        closeMediaPreview()
         // Re-lock the vault whenever the app leaves the foreground, so
         // background/multitasking can't be used to skip the biometric check.
         vaultUnlocked = false
@@ -1022,9 +1184,9 @@ class MainActivity : FragmentActivity() {
                         val deleted = entries.count { it.deletedAt != null }
                         val pending = entries.count { it.deletedFileHash != null && it.deletedAt == null }
                         when {
-                            pending > 0 -> "Chain links verified; $pending audio deletion${if (pending == 1) "" else "s"} still pending"
-                            deleted > 0 -> "Chain verified ✓ — ${entries.size - deleted} recordings intact; $deleted deletion record${if (deleted == 1) "" else "s"} retained"
-                            else -> "Chain verified ✓ — all ${entries.size} recordings intact"
+                            pending > 0 -> "Chain links verified; $pending evidence deletion${if (pending == 1) "" else "s"} still pending"
+                            deleted > 0 -> "Chain verified ✓ — ${entries.size - deleted} evidence items intact; $deleted deletion record${if (deleted == 1) "" else "s"} retained"
+                            else -> "Chain verified ✓ — all ${entries.size} evidence items intact"
                         }
                     }
                 }
@@ -1035,23 +1197,62 @@ class MainActivity : FragmentActivity() {
         }
     }
 
+    private fun runSafeTamperDemo() {
+        if (!vaultUnlocked) return
+        lifecycleScope.launch {
+            val message = runCatching {
+                withContext(Dispatchers.IO) {
+                    sealMutex.withLock {
+                        val entry = db.evidenceDao().allAscending().lastOrNull { it.deletedFileHash == null }
+                            ?: return@withLock "Seal a recording first, then run the tamper test"
+                        val original = File(filesDir, entry.encryptedFile)
+                        if (!original.exists()) return@withLock "Evidence file is unavailable for the tamper test"
+                        check(Crypto.chainHash(Crypto.sha256(original), entry.previousHash) == entry.sha256) {
+                            "Original evidence already fails verification"
+                        }
+                        val copy = File(cacheDir, "tamper_probe_${entry.id}.enc")
+                        try {
+                            original.copyTo(copy, overwrite = true)
+                            java.io.RandomAccessFile(copy, "rw").use { probe ->
+                                val offset = probe.length() - 1L
+                                check(offset >= 0L) { "Evidence copy is empty" }
+                                probe.seek(offset)
+                                val changed = probe.readByte().toInt() xor 1
+                                probe.seek(offset)
+                                probe.writeByte(changed)
+                            }
+                            check(Crypto.chainHash(Crypto.sha256(copy), entry.previousHash) != entry.sha256) {
+                                "Tamper probe was not detected"
+                            }
+                            "Temporary copy failed integrity verification; the original vault file is unchanged"
+                        } finally {
+                            copy.delete()
+                        }
+                    }
+                }
+            }.getOrElse { "Tamper test failed: ${it.message ?: "storage error"}" }
+            snackbarHostState.showSnackbar(message)
+        }
+    }
+
     private fun deleteEvidence(evidence: Evidence) {
         if (!vaultUnlocked) return
         if (playbackState.evidenceId == evidence.id) stopEvidencePlayback()
+        if (mediaPreviewState.evidenceId == evidence.id) closeMediaPreview()
         lifecycleScope.launch {
             try {
                 withContext(NonCancellable + Dispatchers.IO) {
                     sealMutex.withLock {
                         val dao = db.evidenceDao()
-                        val current = dao.byId(evidence.id) ?: throw IOException("Recording no longer exists")
+                        val current = dao.byId(evidence.id) ?: throw IOException("Evidence no longer exists")
                         if (current.deletedAt != null) return@withLock
                         val encrypted = File(filesDir, current.encryptedFile)
                         val fileHash = current.deletedFileHash ?: run {
-                            if (!encrypted.exists()) throw IOException("Encrypted recording is missing; verify the chain")
+                            if (!encrypted.exists()) throw IOException("Encrypted evidence is missing; verify the chain")
                             Crypto.sha256(encrypted)
                         }
                         if (Crypto.chainHash(fileHash, current.previousHash) != current.sha256) {
-                            throw IOException("Recording hash does not match the vault chain")
+                            throw IOException("Evidence hash does not match the vault chain")
                         }
                         if (current.deletedFileHash == null && dao.requestDeletion(current.id, fileHash) != 1) {
                             throw IOException("Could not save the deletion record")
@@ -1059,7 +1260,7 @@ class MainActivity : FragmentActivity() {
                         completePendingDeletion(current.copy(deletedFileHash = fileHash))
                     }
                 }
-                snackbarHostState.showSnackbar("Recording deleted; its hash-chain deletion record remains")
+                snackbarHostState.showSnackbar("Evidence deleted; its hash-chain deletion record remains")
             } catch (e: Exception) {
                 snackbarHostState.showSnackbar("Delete incomplete: ${e.message ?: "storage error"}. Tap Delete to retry")
             }
@@ -1102,33 +1303,50 @@ class MainActivity : FragmentActivity() {
                         }
                     }
 
-                    // A crash after the Room commit but before plaintext cleanup
-                    // can leave the matching pending raw file behind. A present
-                    // encrypted file plus its DB row proves that cleanup is safe.
-                    entries.filter { it.deletedFileHash == null }.forEach { entry ->
-                        if (File(filesDir, entry.encryptedFile).exists()) pendingRawFor(entry.encryptedFile)?.delete()
+                    // A row and a filename alone do not prove that encryption
+                    // finished intact. Keep raw audio until ciphertext authenticates
+                    // and its hash still matches the committed chain entry.
+                    for (entry in entries.filter { it.deletedFileHash == null }) {
+                        val raw = pendingRawFor(entry.encryptedFile)?.takeIf { it.exists() } ?: continue
+                        val encrypted = File(filesDir, entry.encryptedFile)
+                        if (!encrypted.exists()) continue
+                        val hashMatches = Crypto.chainHash(Crypto.sha256(encrypted), entry.previousHash) == entry.sha256
+                        if (!hashMatches || !encryptedEvidenceValid(encrypted, entry.mediaType == "AUDIO")) {
+                            failure = "Evidence #${entry.id} could not be verified; its raw copy was retained"
+                            break
+                        }
+                        raw.delete()
                     }
 
                     val orphanedFiles = filesDir.listFiles()
                         .orEmpty()
                         .filter { file ->
-                            file.isFile && file.name.matches(Regex("evidence_\\d+\\.enc")) &&
+                            file.isFile && isEvidenceEncryptedFile(file.name) &&
                                 file.name !in knownFiles
                         }
+                    val pendingAudio = File(filesDir, "pending").listFiles()
+                        .orEmpty()
+                        .filter { file -> file.isFile && file.name.matches(Regex("evidence_\\d+(?:_audio_\\d+)?\\.raw\\.m4a")) &&
+                            file.length() > 0L && !SegmentedRecorder.isInFlight(file) }
+                    val candidates = (orphanedFiles + pendingAudio)
                         .sortedWith(compareBy<File>(
                             { evidenceTimestamp(it.name) ?: Long.MAX_VALUE },
+                            { if (it.extension == "enc") 0 else 1 },
                             { it.lastModified() },
                             { it.name }
                         ))
                     var recovered = 0
 
-                    for (file in orphanedFiles) {
+                    for (file in if (failure == null) candidates else emptyList()) {
                         try {
-                            if (file.length() <= 28L) throw IOException("${file.name} is incomplete")
-                            val fileHash = Crypto.sha256(file)
-                            val createdAt = evidenceTimestamp(file.name) ?: file.lastModified()
-                            dao.insertChained(
-                                Evidence(
+                            if (file.extension == "enc") {
+                                if (file.length() <= 28L) throw IOException("${file.name} is incomplete")
+                                val createdAt = evidenceTimestamp(file.name) ?: file.lastModified()
+                                val media = mediaMetadata(file.name)
+                                if (!encryptedEvidenceValid(file, media?.first == "AUDIO" || media == null)) {
+                                    throw IOException("${file.name} could not be decrypted; any raw copy was retained")
+                                }
+                                dao.insertChained(Evidence(
                                     createdAt = createdAt,
                                     encryptedFile = file.name,
                                     latitude = null,
@@ -1136,11 +1354,29 @@ class MainActivity : FragmentActivity() {
                                     threatLabel = "Recovered evidence",
                                     threatScore = 0,
                                     sha256 = "",
-                                    previousHash = null
-                                ),
-                                fileHash
-                            )
-                            pendingRawFor(file.name)?.delete()
+                                    previousHash = null,
+                                    incidentId = media?.second ?: createdAt.toString(),
+                                    mediaType = media?.first ?: "AUDIO",
+                                    mimeType = media?.third ?: "audio/mp4"
+                                ), Crypto.sha256(file))
+                                knownFiles.add(file.name)
+                                pendingRawFor(file.name)?.delete()
+                            } else {
+                                val encryptedName = file.name.removeSuffix(".raw.m4a") + ".enc"
+                                if (encryptedName in knownFiles && File(filesDir, encryptedName).exists()) {
+                                    file.delete()
+                                    continue
+                                }
+                                if (!AudioEvidenceFile.isPlayable(file)) {
+                                    throw IOException("${file.name} is not a finalized audio file; raw bytes were retained")
+                                }
+                                val createdAt = evidenceTimestamp(file.name) ?: file.lastModified()
+                                val media = mediaMetadata(encryptedName)
+                                EvidenceSealer.sealLocked(this@MainActivity, db, key,
+                                    EvidenceSealer.Request(file, "Recovered audio", 0,
+                                        incidentId = media?.second ?: createdAt.toString()))
+                                knownFiles.add(encryptedName)
+                            }
                             recovered++
                         } catch (e: Exception) {
                             // Preserve this and all later files. Appending a newer
@@ -1168,13 +1404,50 @@ class MainActivity : FragmentActivity() {
         }
     }
 
-    private fun evidenceTimestamp(fileName: String): Long? = fileName
-        .removePrefix("evidence_")
-        .removeSuffix(".enc")
-        .toLongOrNull()
+    private fun evidenceTimestamp(fileName: String): Long? =
+        Regex("^evidence_(\\d+)").find(fileName)?.groupValues?.get(1)?.toLongOrNull()
+
+    private fun encryptedEvidenceValid(encrypted: File, audio: Boolean): Boolean {
+        val temporary = File.createTempFile("recovery_", ".raw", cacheDir)
+        return try {
+            Crypto.decrypt(encrypted, temporary, key)
+            !audio || AudioEvidenceFile.isPlayable(temporary)
+        } catch (_: Exception) {
+            false
+        } finally {
+            temporary.delete()
+        }
+    }
+
+    private fun isEvidenceEncryptedFile(fileName: String): Boolean =
+        fileName.matches(Regex("evidence_\\d+\\.enc")) ||
+            mediaMetadata(fileName) != null
+
+    private fun mediaMetadata(fileName: String): Triple<String, String, String>? {
+        val audio = Regex("^evidence_\\d+_audio_(\\d+)\\.enc$").matchEntire(fileName)
+        if (audio != null) return Triple("AUDIO", audio.groupValues[1], "audio/mp4")
+        val match = Regex("^evidence_\\d+_(image|video)_(\\d+)\\.(jpg|png|webp|heic|mp4)\\.enc$")
+            .matchEntire(fileName) ?: return null
+        val mime = when (match.groupValues[3]) {
+            "jpg" -> "image/jpeg"
+            "png" -> "image/png"
+            "webp" -> "image/webp"
+            "heic" -> "image/heic"
+            else -> "video/mp4"
+        }
+        return Triple(match.groupValues[1].uppercase(Locale.US), match.groupValues[2], mime)
+    }
 
     private fun pendingRawFor(encryptedFileName: String): File? {
         val captureId = evidenceTimestamp(encryptedFileName) ?: return null
+        if (encryptedFileName.matches(Regex("^evidence_\\d+_audio_\\d+\\.enc$"))) {
+            return File(File(filesDir, "pending"), encryptedFileName.removeSuffix(".enc") + ".raw.m4a")
+        }
+        if (mediaMetadata(encryptedFileName) != null) {
+            val name = encryptedFileName.removeSuffix(".enc")
+            val extension = name.substringAfterLast('.')
+            return File(File(filesDir, "pending"), "${name.removeSuffix(".$extension")}.raw.$extension")
+        }
         return File(File(filesDir, "pending"), "evidence_$captureId.raw.m4a")
     }
 
@@ -1353,6 +1626,68 @@ class MainActivity : FragmentActivity() {
         playbackState = EvidencePlaybackState()
     }
 
+    private fun openMediaPreview(evidence: Evidence) {
+        if (!vaultUnlocked || evidence.mediaType.equals("AUDIO", ignoreCase = true)) return
+        closeMediaPreview()
+        val encryptedFile = File(filesDir, evidence.encryptedFile)
+        if (!encryptedFile.exists()) {
+            lifecycleScope.launch { snackbarHostState.showSnackbar("Encrypted media file not found") }
+            return
+        }
+        val requestId = ++mediaPreviewRequestId
+        val extension = when {
+            evidence.mimeType.contains("png", true) -> "png"
+            evidence.mimeType.contains("webp", true) -> "webp"
+            evidence.mimeType.contains("heic", true) -> "heic"
+            evidence.mediaType.equals("VIDEO", true) -> "mp4"
+            else -> "jpg"
+        }
+        val temporary = File(cacheDir, "temp_preview_${evidence.id}_$requestId.$extension")
+        mediaPreviewState = EvidenceMediaPreviewState(
+            evidenceId = evidence.id,
+            mediaType = evidence.mediaType,
+            mimeType = evidence.mimeType,
+            isPreparing = true
+        )
+        mediaPreviewJob = lifecycleScope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    if (temporary.exists() && !temporary.delete()) throw IOException("Could not clear preview cache")
+                    Crypto.decrypt(encryptedFile, temporary, key)
+                }
+                if (requestId != mediaPreviewRequestId || !vaultUnlocked || !foreground) {
+                    temporary.delete()
+                    return@launch
+                }
+                mediaPreviewTempFile = temporary
+                mediaPreviewState = EvidenceMediaPreviewState(
+                    evidenceId = evidence.id,
+                    mediaType = evidence.mediaType,
+                    mimeType = evidence.mimeType,
+                    filePath = temporary.absolutePath
+                )
+            } catch (cancelled: CancellationException) {
+                temporary.delete()
+                throw cancelled
+            } catch (error: Exception) {
+                temporary.delete()
+                if (requestId == mediaPreviewRequestId) {
+                    mediaPreviewState = EvidenceMediaPreviewState()
+                    snackbarHostState.showSnackbar("Media preview failed: ${error.message}")
+                }
+            }
+        }
+    }
+
+    private fun closeMediaPreview() {
+        mediaPreviewRequestId++
+        mediaPreviewJob?.cancel()
+        mediaPreviewJob = null
+        mediaPreviewTempFile?.delete()
+        mediaPreviewTempFile = null
+        mediaPreviewState = EvidenceMediaPreviewState()
+    }
+
     private fun releasePlaybackResources(player: MediaPlayer, tempAudio: File?) {
         if (mediaPlayer === player) mediaPlayer = null
         runCatching { player.release() }
@@ -1363,8 +1698,8 @@ class MainActivity : FragmentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         gestureDetector.stop()
-        speechRecognizer?.destroy()
+        offlineListeningJob?.cancel()
         stopEvidencePlayback()
-        analyzer.close()
+        closeMediaPreview()
     }
 }

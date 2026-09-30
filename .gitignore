@@ -35,6 +35,7 @@ captures/
 # Keystore files
 *.jks
 *.keystore
+keystore.properties
 
 # External native build folder
 .cxx/
@@ -43,3 +44,17 @@ captures/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Local signing material and generated workspace files
+release-signing/
+.android/
+*.log
+phase4_edit.py
+
+# Cached downloads and duplicate model copies; the build uses app assets
+third_party/indictrans2-onnx-int8/
+third_party/indictrans2-python-test/
+third_party/android-ndk-r25c-windows.zip
+third_party/cmake-3.22.1-windows.zip
+third_party/whisper-cpp.tar.gz
+third_party/ort-classes.jar

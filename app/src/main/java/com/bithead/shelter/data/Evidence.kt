@@ -1,6 +1,7 @@
 package com.bithead.shelter.data
 
 import androidx.room.Entity
+import androidx.room.ColumnInfo
 import androidx.room.PrimaryKey
 
 @Entity(tableName = "evidence")
@@ -15,5 +16,8 @@ data class Evidence(
     val sha256: String,
     val previousHash: String?,
     val deletedFileHash: String? = null,
-    val deletedAt: Long? = null
+    val deletedAt: Long? = null,
+    val incidentId: String? = null,
+    @ColumnInfo(defaultValue = "'AUDIO'") val mediaType: String = "AUDIO",
+    @ColumnInfo(defaultValue = "'audio/mp4'") val mimeType: String = "audio/mp4"
 )

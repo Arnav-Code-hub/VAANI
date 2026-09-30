@@ -6,36 +6,38 @@
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data: https://tile.openstreetmap.org; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'">
     <link rel="stylesheet" href="leaflet/leaflet.css">
     <style>
-        html, body { width: 100%; height: 100%; margin: 0; background: #e4ebdf; }
+        html, body { width: 100%; height: 100%; margin: 0; background: #0f0f11; }
         body { font-family: system-ui, sans-serif; position: relative; }
         #map { position: absolute; inset: 0; width: 100%; height: 100%; }
         .legend {
-            background: rgba(252, 249, 243, .94);
-            border-radius: 10px;
+            background: rgba(21, 29, 26, .96);
+            border-radius: 4px;
             box-shadow: 0 2px 10px rgba(28, 28, 24, .18);
-            color: #1c1c18;
+            color: #e8e6e0;
             font-size: 12px;
             line-height: 20px;
             padding: 8px 10px;
         }
         .legend i { border-radius: 50%; display: inline-block; height: 10px; margin-right: 7px; width: 10px; }
-        .leaflet-popup-content-wrapper, .leaflet-popup-tip { background: #fcf9f3; color: #1c1c18; }
-        .leaflet-control-attribution { font-size: 9px; }
+        .leaflet-tile-pane { filter: brightness(.68) saturate(.72) contrast(1.18); }
+        .leaflet-popup-content-wrapper, .leaflet-popup-tip { background: #1a1a1d; color: #e8e6e0; }
+        .leaflet-control-attribution { background: rgba(11,15,14,.82) !important; color: #9a9a9e; font-size: 9px; }
+        .leaflet-control-attribution a { color: #d4aa30; }
         .user-tooltip {
-            background: #204637;
+            background: #c9a227;
             border: 0;
-            border-radius: 7px;
+            border-radius: 4px;
             box-shadow: 0 2px 7px rgba(28, 28, 24, .25);
-            color: #fff;
+            color: #0d0d0f;
             font-weight: 700;
             padding: 5px 8px;
         }
-        .user-tooltip::before { border-top-color: #204637 !important; }
+        .user-tooltip::before { border-top-color: #c9a227 !important; }
         .recenter-control button {
             align-items: center;
-            background: #fcf9f3;
+            background: #1a1a1d;
             border: 0;
-            color: #204637;
+            color: #c9a227;
             cursor: pointer;
             display: flex;
             font-size: 22px;
@@ -46,7 +48,7 @@
         #tile-status {
             align-items: center;
             background: rgba(49, 49, 45, .94);
-            border-radius: 10px;
+            border-radius: 4px;
             color: #fff;
             display: flex;
             font-size: 12px;
@@ -61,10 +63,10 @@
         }
         #tile-status.hidden { display: none; }
         #retry-tiles {
-            background: #d9f3e5;
+            background: #c9a227;
             border: 0;
-            border-radius: 7px;
-            color: #204637;
+            border-radius: 4px;
+            color: #0d0d0f;
             cursor: pointer;
             font-weight: 700;
             padding: 6px 9px;
@@ -79,6 +81,36 @@
 </div>
 <script src="leaflet/leaflet.js"></script>
 <script>
+    // Visible text in English and Hindi, chosen by the app via ?lang=hi.
+    const LANG = new URLSearchParams(window.location.search).get('lang') === 'hi' ? 'hi' : 'en';
+    const TEXT = {
+        en: {
+            loading: 'Loading map tiles…', retry: 'Retry Tiles', offline: 'Offline — connect to the internet to load map tiles.',
+            reloading: 'Reloading map tiles…', someFailed: 'Some map tiles could not load.',
+            corridor: 'Well-lit corridor', corridorDetail: 'Adaptive sample community route',
+            market: 'Patrolled point · Local market', transit: 'Patrolled point · Transit stop', pharmacy: 'Verified haven · 24-hour pharmacy',
+            supportDetail: 'Adaptive sample support location', highRisk: 'Higher reported risk', mediumRisk: 'Moderate reported risk',
+            recenter: 'Recenter on your location', history: 'Adaptive sample incident history', youAreHere: 'You are here',
+            yourLocation: 'Your current location', accuracy: 'Accuracy: about', meters: 'm', updated: 'Updated',
+            mapLabel: 'Interactive community safety map'
+        },
+        hi: {
+            loading: 'मानचित्र लोड हो रहा है…', retry: 'फिर से लोड करें', offline: 'ऑफ़लाइन — मानचित्र के लिए इंटरनेट से जुड़ें।',
+            reloading: 'मानचित्र फिर से लोड हो रहा है…', someFailed: 'मानचित्र के कुछ हिस्से लोड नहीं हुए।',
+            corridor: 'रोशन रास्ता', corridorDetail: 'नमूना सामुदायिक रास्ता',
+            market: 'गश्त बिंदु · स्थानीय बाज़ार', transit: 'गश्त बिंदु · बस/मेट्रो स्टॉप', pharmacy: 'सत्यापित ठिकाना · 24 घंटे दवा दुकान',
+            supportDetail: 'नमूना सहायता स्थान', highRisk: 'अधिक जोखिम की रिपोर्ट', mediumRisk: 'मध्यम जोखिम की रिपोर्ट',
+            recenter: 'अपनी लोकेशन पर लाएँ', history: 'नमूना घटना इतिहास', youAreHere: 'आप यहाँ हैं',
+            yourLocation: 'आपकी वर्तमान लोकेशन', accuracy: 'सटीकता: लगभग', meters: 'मी.', updated: 'अपडेट',
+            mapLabel: 'इंटरैक्टिव सामुदायिक सुरक्षा मानचित्र'
+        }
+    };
+    const t = key => TEXT[LANG][key] || TEXT.en[key];
+    document.documentElement.lang = LANG;
+    document.getElementById('map').setAttribute('aria-label', t('mapLabel'));
+    document.getElementById('tile-status-message').textContent = t('loading');
+    document.getElementById('retry-tiles').textContent = t('retry');
+
     const DEFAULT_CENTER = [28.6335, 77.2199];
     const map = L.map('map', { zoomControl: true }).setView(DEFAULT_CENTER, 13);
     const tileStatus = document.getElementById('tile-status');
@@ -103,27 +135,27 @@
 
     function retryTiles() {
         if (!navigator.onLine) {
-            showTileStatus('Offline — connect to the internet to load map tiles.', true);
+            showTileStatus(t('offline'), true);
             return;
         }
         tileErrors = 0;
-        showTileStatus('Reloading map tiles…', false);
+        showTileStatus(t('reloading'), false);
         tileLayer.redraw();
         window.invalidateMapSize();
     }
 
-    tileLayer.on('loading', () => showTileStatus('Loading map tiles…', false));
+    tileLayer.on('loading', () => showTileStatus(t('loading'), false));
     tileLayer.on('load', () => {
         if (tileErrors === 0) hideTileStatus();
-        else if (!navigator.onLine) showTileStatus('Offline — connect to the internet to load map tiles.', true);
-        else showTileStatus('Some map tiles could not load.', true);
+        else if (!navigator.onLine) showTileStatus(t('offline'), true);
+        else showTileStatus(t('someFailed'), true);
     });
     tileLayer.on('tileerror', () => {
         tileErrors += 1;
-        showTileStatus('Some map tiles could not load.', true);
+        showTileStatus(t('someFailed'), true);
     });
     retryTilesButton.addEventListener('click', retryTiles);
-    window.addEventListener('offline', () => showTileStatus('Offline — connect to the internet to load map tiles.', true));
+    window.addEventListener('offline', () => showTileStatus(t('offline'), true));
     window.addEventListener('online', retryTiles);
     tileLayer.addTo(map);
 
@@ -167,18 +199,18 @@
             offsetPoint(center, 430, 300),
             offsetPoint(center, 860, 560)
         ];
-        L.polyline(corridor, { color: '#204637', weight: 7, opacity: .9 })
-            .bindPopup('<strong>Well-lit corridor</strong><br>Adaptive sample community route')
+        L.polyline(corridor, { color: '#c9a227', weight: 7, opacity: .9 })
+            .bindPopup(`<strong>${t('corridor')}</strong><br>${t('corridorDetail')}`)
             .addTo(corridorLayer);
 
         [
-            [offsetPoint(center, -260, -320), 'Patrolled point · Local market'],
-            [offsetPoint(center, 380, 360), 'Patrolled point · Transit stop'],
-            [offsetPoint(center, -580, 260), 'Verified haven · 24-hour pharmacy']
+            [offsetPoint(center, -260, -320), t('market')],
+            [offsetPoint(center, 380, 360), t('transit')],
+            [offsetPoint(center, -580, 260), t('pharmacy')]
         ].forEach(item => {
             L.circleMarker(item[0], {
-                radius: 8, color: '#52606a', fillColor: '#d3e2ed', fillOpacity: 1, weight: 3
-            }).bindPopup(`<strong>${item[1]}</strong><br><small>Adaptive sample support location</small>`)
+                radius: 8, color: '#5a5a60', fillColor: '#7aa2b2', fillOpacity: 1, weight: 3
+            }).bindPopup(`<strong>${item[1]}</strong><br><small>${t('supportDetail')}</small>`)
                 .addTo(patrolLayer);
         });
     }
@@ -188,9 +220,9 @@
     const legend = L.control({ position: 'bottomleft' });
     legend.onAdd = function () {
         const box = L.DomUtil.create('div', 'legend');
-        box.innerHTML = '<div><i style="background:#b3261e"></i>Higher reported risk</div>' +
-            '<div><i style="background:#d97706"></i>Moderate reported risk</div>' +
-            '<div><i style="background:#204637"></i>Well-lit corridor</div>';
+        box.innerHTML = '<div><i style="background:#8f2d2d"></i>' + t('highRisk') + '</div>' +
+            '<div><i style="background:#d97706"></i>' + t('mediumRisk') + '</div>' +
+            '<div><i style="background:#c9a227"></i>' + t('corridor') + '</div>';
         return box;
     };
     legend.addTo(map);
@@ -241,8 +273,8 @@
             const container = L.DomUtil.create('div', 'leaflet-bar recenter-control');
             const button = L.DomUtil.create('button', '', container);
             button.type = 'button';
-            button.title = 'Recenter on your location';
-            button.setAttribute('aria-label', 'Recenter on your location');
+            button.title = t('recenter');
+            button.setAttribute('aria-label', t('recenter'));
             button.textContent = '◎';
             L.DomEvent.disableClickPropagation(container);
             L.DomEvent.on(button, 'click', window.recenterUserLocation);
@@ -257,14 +289,14 @@
         zones.filter(zone => Number.isFinite(zone.lat) && zone.lat >= -90 && zone.lat <= 90 &&
             Number.isFinite(zone.lng) && zone.lng >= -180 && zone.lng <= 180 &&
             Number.isFinite(zone.radius) && zone.radius > 0).forEach(zone => {
-            const color = zone.level === 'high' ? '#b3261e' : '#d97706';
+            const color = zone.level === 'high' ? '#8f2d2d' : '#d97706';
             const popup = document.createElement('div');
             const title = document.createElement('strong');
             const detail = document.createElement('div');
             const source = document.createElement('small');
             title.textContent = zone.title;
             detail.textContent = zone.detail;
-            source.textContent = 'Adaptive sample incident history';
+            source.textContent = t('history');
             popup.append(title, detail, source);
             L.circle([zone.lat, zone.lng], {
                 color, fillColor: color, fillOpacity: .22, opacity: .85, radius: zone.radius, weight: 2
@@ -291,17 +323,17 @@
 
         userAccuracyCircle = L.circle(userLatLng, {
             radius: accuracy,
-            color: '#204637',
-            fillColor: '#74b99c',
+            color: '#c9a227',
+            fillColor: '#c9a227',
             fillOpacity: .14,
             opacity: .65,
             weight: 2
         }).addTo(map);
         userMarker = L.circleMarker(userLatLng, {
-            radius: 9, color: '#ffffff', fillColor: '#204637', fillOpacity: 1, weight: 4
-        }).bindTooltip('You are here', {
+            radius: 9, color: '#e8e6e0', fillColor: '#c9a227', fillOpacity: 1, weight: 4
+        }).bindTooltip(t('youAreHere'), {
             permanent: true, direction: 'top', offset: [0, -8], className: 'user-tooltip'
-        }).bindPopup(`<strong>Your current location</strong><br><small>Accuracy: about ${Math.round(accuracy)} m<br>Updated ${updated.toLocaleTimeString()}</small>`)
+        }).bindPopup(`<strong>${t('yourLocation')}</strong><br><small>${t('accuracy')} ${Math.round(accuracy)} ${t('meters')}<br>${t('updated')} ${updated.toLocaleTimeString(LANG === 'hi' ? 'hi-IN' : undefined)}</small>`)
             .addTo(map);
         map.setView(userLatLng, 15);
         window.invalidateMapSize();

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Disguise launcher icon: a lined note sheet inside the 66dp adaptive safe zone. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M38,32h24l10,10v31a3,3 0,0 1,-3 3h-31a3,3 0,0 1,-3 -3v-38a3,3 0,0 1,3 -3z" />
+    <path
+        android:fillColor="#E8E1C8"
+        android:pathData="M62,32v7a3,3 0,0 0,3 3h7z" />
+    <path
+        android:fillColor="#9A8F6E"
+        android:pathData="M42,50h24v3h-24zM42,58h24v3h-24zM42,66h16v3h-16z" />
+</vector>
