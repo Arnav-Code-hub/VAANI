@@ -1,5 +1,9 @@
 package com.bithead.shelter.ui.components
 
+import com.bithead.shelter.i18n.mediaTypeLabel
+import com.bithead.shelter.i18n.str
+import com.bithead.shelter.R
+
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -45,6 +49,14 @@ data class EvidencePlaybackState(
     val isPlaying: Boolean = false,
     val positionMs: Long = 0L,
     val durationMs: Long = 0L
+)
+
+data class EvidenceMediaPreviewState(
+    val evidenceId: Long? = null,
+    val mediaType: String? = null,
+    val mimeType: String? = null,
+    val filePath: String? = null,
+    val isPreparing: Boolean = false
 )
 
 /** Big center action button with a soft breathing/pulsing halo behind it. */
@@ -99,7 +111,7 @@ fun PulseTriggerButton(
                 )
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    text = if (isEmergency) "STOP &\nSEAL" else "ACTIVATE",
+                    text = if (isEmergency) str(R.string.stop_seal) else str(R.string.activate),
                     color = Color.White,
                     fontWeight = FontWeight.Black,
                     fontSize = 15.sp,
@@ -153,13 +165,13 @@ fun ListeningBars(active: Boolean, color: Color, modifier: Modifier = Modifier) 
 @Composable
 fun ThreatMeter(label: String, score: Int, modifier: Modifier = Modifier) {
     val color = when {
-        score >= 70 -> ShelterDanger
-        score >= 35 -> ShelterAmber
-        else -> ShelterSafe
+        score >= 70 -> ShelterDangerInk
+        score >= 35 -> ShelterSafeInk
+        else -> ShelterBlueSoft
     }
     Column(modifier = modifier) {
         Row(horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
-            Text("THREAT AI", style = MaterialTheme.typography.labelLarge, color = ShelterTextDim)
+            Text(str(R.string.sound_analysis_on_device), style = MaterialTheme.typography.labelLarge, color = ShelterTextDim)
             Text("$score/100", style = MaterialTheme.typography.titleMedium, color = color, fontWeight = FontWeight.Bold)
         }
         Spacer(Modifier.height(6.dp))
@@ -189,19 +201,22 @@ fun EvidenceCard(
     chainHash: String,
     previousHash: String?,
     summary: String,
+    mediaType: String,
     playback: EvidencePlaybackState,
     onPlayPause: () -> Unit,
     onStop: () -> Unit,
     onSeek: (Long) -> Unit,
+    onOpenMedia: () -> Unit,
     onExport: () -> Unit,
     deletionPending: Boolean,
     onDelete: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val isAudio = mediaType.equals("AUDIO", ignoreCase = true)
     val severity = when {
-        threatScore >= 70 -> ShelterDanger
-        threatScore >= 35 -> ShelterAmber
-        else -> ShelterSafe
+        threatScore >= 70 -> ShelterDangerInk
+        threatScore >= 35 -> ShelterSafeInk
+        else -> ShelterBlueSoft
     }
     val isActive = playback.evidenceId == index
     var draggedPosition by remember(index) { mutableFloatStateOf(0f) }
@@ -209,10 +224,11 @@ fun EvidenceCard(
     LaunchedEffect(isActive, playback.positionMs) {
         if (isActive && !isDragging) draggedPosition = playback.positionMs.toFloat()
     }
-    ElevatedCard(
+    OutlinedCard(
         modifier = modifier.fillMaxWidth(),
-        colors = CardDefaults.elevatedCardColors(containerColor = ShelterSurface),
-        elevation = CardDefaults.elevatedCardElevation(defaultElevation = 2.dp)
+        colors = CardDefaults.outlinedCardColors(containerColor = ShelterSurface),
+        shape = RoundedCornerShape(4.dp),
+        border = androidx.compose.foundation.BorderStroke(1.dp, ShelterBorder)
     ) {
         Column(Modifier.padding(16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -227,7 +243,7 @@ fun EvidenceCard(
                 }
                 Spacer(Modifier.width(12.dp))
                 Column(Modifier.weight(1f)) {
-                    Text("Evidence #$index", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurface)
+                    Text(str(R.string.media_evidence_number, mediaTypeLabel(mediaType).replaceFirstChar { it.uppercase() }, index), style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurface)
                     Text(timestamp, style = MaterialTheme.typography.bodyMedium, color = ShelterTextDim)
                 }
                 AssistChip(
@@ -249,7 +265,7 @@ fun EvidenceCard(
                 Icon(Icons.Filled.LocationOn, contentDescription = null, tint = ShelterTextDim, modifier = Modifier.size(14.dp))
                 Spacer(Modifier.width(4.dp))
                 Text(
-                    text = if (lat != null && lng != null) "${lat.toString().take(7)}, ${lng.toString().take(7)}" else "GPS unavailable",
+                    text = if (lat != null && lng != null) "${lat.toString().take(7)}, ${lng.toString().take(7)}" else str(R.string.gps_unavailable),
                     style = MaterialTheme.typography.bodyMedium,
                     color = ShelterTextDim
                 )
@@ -273,7 +289,7 @@ fun EvidenceCard(
                 lineHeight = 16.sp
             )
 
-            if (isActive) {
+            if (isAudio && isActive) {
                 Spacer(Modifier.height(12.dp))
                 val duration = playback.durationMs.coerceAtLeast(1L)
                 Slider(
@@ -298,17 +314,18 @@ fun EvidenceCard(
             Spacer(Modifier.height(12.dp))
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 FilledTonalButton(
-                    onClick = onPlayPause,
+                    onClick = if (isAudio) onPlayPause else onOpenMedia,
                     enabled = !playback.isPreparing && !deletionPending,
                     modifier = Modifier.weight(1f),
                     colors = ButtonDefaults.filledTonalButtonColors(containerColor = ShelterSurfaceRaised, contentColor = MaterialTheme.colorScheme.onSurface)
                 ) {
-                    if (isActive && playback.isPreparing) {
+                    if (isAudio && isActive && playback.isPreparing) {
                         CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
                     } else {
-                        val completed = isActive && playback.durationMs > 0L && playback.positionMs >= playback.durationMs
+                        val completed = isAudio && isActive && playback.durationMs > 0L && playback.positionMs >= playback.durationMs
                         Icon(
                             when {
+                                !isAudio -> if (mediaType.equals("VIDEO", true)) Icons.Filled.PlayArrow else Icons.Filled.Security
                                 isActive && playback.isPlaying -> Icons.Filled.Pause
                                 completed -> Icons.Filled.Replay
                                 else -> Icons.Filled.PlayArrow
@@ -319,38 +336,39 @@ fun EvidenceCard(
                     }
                     Spacer(Modifier.width(6.dp))
                     Text(when {
-                        isActive && playback.isPreparing -> "Opening…"
-                        isActive && playback.isPlaying -> "Pause"
-                        isActive && playback.durationMs > 0L && playback.positionMs >= playback.durationMs -> "Replay"
-                        isActive -> "Resume"
-                        else -> "Play"
+                        !isAudio -> if (mediaType.equals("VIDEO", true)) str(R.string.view_video) else str(R.string.view_image)
+                        isActive && playback.isPreparing -> str(R.string.opening_2)
+                        isActive && playback.isPlaying -> str(R.string.pause)
+                        isActive && playback.durationMs > 0L && playback.positionMs >= playback.durationMs -> str(R.string.replay)
+                        isActive -> str(R.string.resume)
+                        else -> str(R.string.play)
                     })
                 }
-                if (isActive) {
+                if (isAudio && isActive) {
                     IconButton(onClick = onStop) {
-                        Icon(Icons.Filled.Stop, contentDescription = "Stop playback")
+                        Icon(Icons.Filled.Stop, contentDescription = str(R.string.stop_playback))
                     }
                 }
                 OutlinedButton(
                     onClick = onExport,
                     modifier = Modifier.weight(1f)
                 ) {
-                    Text("Export chain of custody")
+                    Text(str(R.string.export_chain_of_custody))
                 }
             }
             if (deletionPending) Text(
-                "Deletion pending — retry to remove the audio file.",
+                str(R.string.deletion_pending_retry_to_remove_the_encrypt),
                 style = MaterialTheme.typography.bodySmall,
-                color = ShelterDanger
+                color = ShelterDangerInk
             )
             TextButton(
                 onClick = onDelete,
                 modifier = Modifier.align(Alignment.End),
-                colors = ButtonDefaults.textButtonColors(contentColor = ShelterDanger)
+                colors = ButtonDefaults.textButtonColors(contentColor = ShelterDangerInk)
             ) {
                 Icon(Icons.Outlined.DeleteForever, contentDescription = null, modifier = Modifier.size(18.dp))
                 Spacer(Modifier.width(6.dp))
-                Text(if (deletionPending) "Retry delete" else "Delete recording")
+                Text(if (deletionPending) str(R.string.retry_delete) else str(R.string.delete_evidence_2))
             }
         }
     }
@@ -369,17 +387,17 @@ fun SafewordRow(safeword: String, onEditClick: () -> Unit, modifier: Modifier = 
     Row(
         modifier = modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(14.dp))
+            .clip(RoundedCornerShape(4.dp))
             .background(ShelterSurface)
             .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Column(Modifier.weight(1f)) {
-            Text("SAFEWORD", style = MaterialTheme.typography.labelLarge, color = ShelterTextDim)
+            Text(str(R.string.safeword), style = MaterialTheme.typography.labelLarge, color = ShelterTextDim)
             Text("\"$safeword\"", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurface)
         }
         IconButton(onClick = onEditClick) {
-            Icon(Icons.Filled.Edit, contentDescription = "Change safeword", tint = ShelterBlueSoft)
+            Icon(Icons.Filled.Edit, contentDescription = str(R.string.change_safeword), tint = ShelterBlueSoft)
         }
     }
 }
@@ -393,23 +411,23 @@ fun SafewordDialog(current: String, onDismiss: () -> Unit, onSave: (String) -> U
         containerColor = ShelterSurface,
         titleContentColor = MaterialTheme.colorScheme.onSurface,
         textContentColor = ShelterTextDim,
-        title = { Text("Set custom safeword") },
+        title = { Text(str(R.string.set_custom_safeword)) },
         text = {
             OutlinedTextField(
                 value = text,
                 onValueChange = { text = it },
                 singleLine = true,
-                placeholder = { Text("e.g. PINEAPPLE") },
+                placeholder = { Text(str(R.string.e_g_pineapple)) },
                 colors = OutlinedTextFieldDefaults.colors(
                     focusedTextColor = MaterialTheme.colorScheme.onSurface,
                     unfocusedTextColor = MaterialTheme.colorScheme.onSurface,
-                    focusedBorderColor = ShelterBlue,
-                    cursorColor = ShelterBlue,
+                    focusedBorderColor = ShelterSafeInk,
+                    cursorColor = ShelterSafeInk,
                 )
             )
         },
         confirmButton = {
-            TextButton(onClick = { if (text.isNotBlank()) onSave(text) }) { Text("Save", color = ShelterBlue) }
+            TextButton(onClick = { if (text.isNotBlank()) onSave(text) }) { Text(str(R.string.save), color = ShelterSafeInk) }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) { Icon(Icons.Filled.Close, contentDescription = null, tint = ShelterTextDim, modifier = Modifier.size(16.dp)) }

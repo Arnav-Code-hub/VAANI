@@ -1,68 +1,70 @@
-# VAANI — Android Hackathon Prototype
+# VAANI Android prototype
 
-VAANI is a privacy-first emergency safety prototype: a spoken safeword triggers
-encrypted, tamper-evident audio evidence capture, entirely stored on-device.
+VAANI records emergency evidence locally, encrypts it with an Android Keystore
+AES-GCM key, and links committed vault records in a SHA-256 chain. The current
+project keeps the dark Compose UI, Notes disguise, media vault, trusted-contact
+SMS, and Leaflet community map.
 
-## What is implemented
-- Safe Mode with no persistent recording
-- Voice-activated SafeWord trigger using Android's SpeechRecognizer (on-device
-  where the OS/device supports it — see "Known limitations" below)
-- Emergency recording using Android MediaRecorder
-- On-device audio threat scoring via a bundled YAMNet TFLite model
-- Active GPS/network location fix at the moment evidence is sealed (with a
-  timeout fallback to the last known fix)
-- AES-256-GCM encryption of evidence, with the key generated and held in the
-  **Android Keystore** (hardware-backed on supported devices) — the raw key
-  material is never stored in SharedPreferences or app files
-- SHA-256 hash chain over sealed evidence, stored in local Room SQLite
-- In-app **"Verify Chain Integrity"** action that recomputes the hash of every
-  sealed evidence file on disk and re-derives the chain, flagging the exact
-  entry where the recomputed hash breaks from the recorded one
-- Local evidence vault UI with permission-denied feedback (mic/location)
+## Current recording behavior
 
-## Known limitations (be upfront about these in the demo)
-- **Safeword detection is not guaranteed fully offline.** We request the
-  on-device recognizer via `EXTRA_PREFER_OFFLINE`, but Android does not
-  guarantee this on every device/OS version — some devices will still route
-  audio through a cloud speech API. A dedicated offline wake-word engine
-  (e.g. OpenWakeWord/Porcupine) is the correct long-term fix; see below.
-- The bundled YAMNet threat-scoring weights are a reasonable first pass but
-  have not been validated against a labeled real-world dataset.
-- No background/foreground-service mode yet — the app only listens/records
-  while in the foreground.
+- Manual and pocket-triggered audio run in a microphone foreground service, so
+  manual recording continues when the app moves to the background. Both stop
+  after five minutes for now, or earlier when the user stops them or available
+  storage falls below 100 MiB. The cap stays until segment hand-off is verified
+  on a physical phone.
+- The recorder hands off approximately 30-second files. One seal worker commits
+  them in capture order. A seal failure retains the raw file and later segments
+  for recovery. Startup recovery also handles finalized encrypted orphans and
+  preserves audio files that cannot be validated as playable.
+- The service sends one emergency SMS batch to the contacts configured when
+  an incident starts. It sends evidence receipts to that same contact snapshot
+  after committed segments and tracks multipart send/delivery callbacks.
+  Settings reports alert and receipt outcomes separately for each contact.
+  SMS permission, SIM, signal, and carrier delivery remain external dependencies.
+- Pocket detection uses a wake-up accelerometer when available. Otherwise it
+  holds a partial wake lock while armed and reports that fallback in Settings.
+  A persistent foreground-service notification remains visible.
+- The debug tamper demo alters a temporary encrypted copy; it does not modify
+  the vault's original ciphertext.
 
-## What remains for the full version
-1. Replace the SpeechRecognizer safeword trigger with a dedicated offline
-   wake-word model (OpenWakeWord/TFLite) for a real offline guarantee.
-2. Validate/tune ThreatAnalyzer scoring weights against real recordings.
-3. Add a background/foreground service for always-on listening, with proper
-   Android 14+/15 foreground-service-type handling.
-4. Add an evidence detail screen (waveform, map pin, full chain history view).
-5. Add automated tests around Crypto.encrypt/decrypt and the chain-integrity
-   verification logic.
+## Voice and language limitations
 
-## Run
-1. Open the `SHELTER` folder in Android Studio.
-2. Let Gradle sync.
-3. Connect an Android phone (Android 8+ recommended) and Run.
-4. Grant microphone and location permissions.
-5. Press `TEST SAFEWORD — ACTIVATE`.
-6. Record for a few seconds, then press `STOP & SEAL EVIDENCE`.
-7. The encrypted evidence and hash chain will appear in the vault.
-8. Press `Verify Chain Integrity` to confirm no evidence has been tampered
-   with since it was sealed.
+The app bundles a multilingual Whisper model and uses local 16 kHz PCM capture
+for safeword recognition. It does not invoke an Android speech provider. Voice
+arming requires a successful local test for the selected safeword and language
+(English, Hindi, Bengali, Marathi, or Tamil). The offline engine currently
+supports arm64 Android devices only. Continuous mode holds the microphone open
+while the app is foregrounded; gesture and pocket safeword modes open a 12-second
+window after a jerk. Manual and instant-gesture recording remain available if
+voice recognition is unavailable.
 
-## Demo script
-Safe Mode → press Test SafeWord → Emergency Mode → record 5–10 s → Stop & Seal
-→ show encrypted file + threat score + SHA-256 chain → press "Verify Chain
-Integrity" to show it passes → (optional, for a stronger demo) manually edit
-one sealed `.enc` file on disk and re-run verification to show it correctly
-flags that entry as tampered → explain that a real offline wake-word model is
-the next integration layer.
+The app also bundles an IndicTrans2 INT8 ONNX export for generated, noncritical
+Vault summaries. Fixed safety text and emergency SMS remain in English until
+their translations receive human review. Contact language preferences are saved
+but do not yet change SMS content. See [offline model provenance](docs/OFFLINE_MODELS.md)
+for versions, hashes, and licenses. Recognition accuracy, inference latency, and
+translation output have not yet passed physical-phone and fresh-install
+airplane-mode tests; do not rely on voice protection for an emergency yet.
 
-## Important prototype disclosure
-The threat analyzer runs real on-device YAMNet inference (not simulated), and
-evidence keys are Keystore-backed. The safeword *trigger path*, however, is
-still built on Android's general-purpose SpeechRecognizer rather than a
-dedicated offline wake-word model — do not describe safeword detection as
-fully offline until that replacement is made.
+## Build and check
+
+Run `./gradlew assembleDebug testDebugUnitTest`. The application ID remains
+`com.bithead.shelter` and the Room database remains `shelter.db` so an APK
+signed with the same key can upgrade an existing installation without deleting
+its vault. Test the microphone foreground service, 30-second hand-offs,
+screen-locked pocket trigger, SMS callbacks, and migration on a physical phone
+before relying on it for emergency use.
+
+## Publishing source to GitHub
+
+Install Git LFS before adding files. The models under
+`app/src/main/assets/models/` are LFS-tracked by `.gitattributes`; a regular Git
+push cannot accept the largest model file. Do not commit signing keys,
+`keystore.properties`, `local.properties`, APKs, build outputs, or the cached
+downloads under `third_party/`. Those are excluded by `.gitignore`.
+
+The existing local `app/vaani-debug.keystore` keeps debug APK updates compatible
+on this computer. It is private and not uploaded. A fresh clone uses Android's
+normal generated debug key, so its debug APK will not update an installation
+signed with this computer's key. Keep the permanent release keystore backed up
+separately for future release updates.

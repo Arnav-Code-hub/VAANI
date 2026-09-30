@@ -7,13 +7,34 @@
     <uses-permission android:name="android.permission.USE_BIOMETRIC" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.SEND_SMS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-feature android:name="android.hardware.camera.any" android:required="false" />
 
     <application
         android:theme="@style/Theme.SHELTER"
         android:label="VAANI"
-        android:icon="@drawable/vaani_mark"
+        android:icon="@mipmap/ic_launcher_vaani"
+        android:roundIcon="@mipmap/ic_launcher_vaani"
         android:allowBackup="false"
         android:supportsRtl="true">
+
+        <service
+            android:name=".emergency.LocationTrackingService"
+            android:exported="false"
+            android:foregroundServiceType="location" />
+        <service
+            android:name=".emergency.PocketProtectionService"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
+        <receiver
+            android:name=".emergency.SmsStatusReceiver"
+            android:exported="false" />
 
         <activity
             android:name=".MainActivity"
@@ -23,7 +44,8 @@
             android:name=".VaaniAlias"
             android:enabled="true"
             android:exported="true"
-            android:icon="@drawable/vaani_mark"
+            android:icon="@mipmap/ic_launcher_vaani"
+            android:roundIcon="@mipmap/ic_launcher_vaani"
             android:label="VAANI"
             android:targetActivity=".MainActivity">
             <intent-filter>
@@ -36,7 +58,8 @@
             android:name=".NotesAlias"
             android:enabled="false"
             android:exported="true"
-            android:icon="@drawable/ic_notes_launcher"
+            android:icon="@mipmap/ic_launcher_notes"
+            android:roundIcon="@mipmap/ic_launcher_notes"
             android:label="Notes"
             android:targetActivity=".MainActivity">
             <intent-filter>
